@@ -1,0 +1,24 @@
+[package]
+name = "yule-gpu"
+description = "GPU compute backends: Vulkan, CUDA, Metal, and CPU SIMD fallback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+yule-core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytemuck = { workspace = true }
+
+ash = { workspace = true, optional = true }
+gpu-allocator = { workspace = true, optional = true }
+
+[features]
+default = ["cpu"]
+cpu = []
+vulkan = ["dep:ash", "dep:gpu-allocator"]
+cuda = []
+metal = []

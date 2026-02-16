@@ -1,0 +1,21 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Gate { float gate[]; };
+layout(set = 0, binding = 1) buffer Up { float up[]; };
+layout(set = 0, binding = 2) buffer Out { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint size;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+
+    float x = gate[idx];
+    // SiLU(x) = x * sigmoid(x)
+    float silu_x = x / (1.0 + exp(-x));
+    out_data[idx] = silu_x * up[idx];
+}

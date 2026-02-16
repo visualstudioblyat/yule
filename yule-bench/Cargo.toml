@@ -1,0 +1,25 @@
+[package]
+name = "yule-bench"
+description = "Benchmarking suite for Yule inference performance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bench]]
+name = "inference"
+harness = false
+
+[[bench]]
+name = "dequant"
+harness = false
+
+[dependencies]
+yule-core = { workspace = true }
+yule-infer = { workspace = true }
+yule-gpu = { workspace = true }
+yule-verify = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "yule-infer"
+description = "Inference engine: attention, KV cache, sampling, quantization, token generation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+yule-core = { workspace = true }
+yule-gpu = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytemuck = { workspace = true }
+getrandom = { workspace = true }
+
+[features]
+default = []
+vulkan = ["yule-gpu/vulkan"]

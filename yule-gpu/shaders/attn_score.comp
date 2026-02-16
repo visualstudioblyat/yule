@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer QueryBuf { float query[]; };
+layout(set = 0, binding = 1) buffer KeyCache { float key_cache[]; };
+layout(set = 0, binding = 2) buffer Scores { float scores[]; };
+layout(set = 0, binding = 3) buffer Scratch { float scratch[]; };
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint seq_len;
+    uint head_offset;   // byte offset into Q for this head
+    uint kv_offset;     // offset within each position for this KV head
+    uint kv_stride;     // total elements per position in KV cache
+};
+
+shared float partial_dots[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint pos = gl_WorkGroupID.x;
+    if (pos >= seq_len) return;
+
+    float dot = 0.0;
+    for (uint i = tid; i < head_dim; i += gl_WorkGroupSize.x) {
+        dot += query[head_offset + i] * key_cache[pos * kv_stride + kv_offset + i];
+    }
+    partial_dots[tid] = dot;
+    barrier();
+
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) partial_dots[tid] += partial_dots[tid + s];
+        barrier();
+    }
+
+    if (tid == 0) {
+        scores[pos] = partial_dots[0] / sqrt(float(head_dim));
+    }
+}

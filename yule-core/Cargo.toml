@@ -1,0 +1,17 @@
+[package]
+name = "yule-core"
+description = "Core types, tensor abstractions, and model metadata for the Yule inference runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytemuck = { workspace = true }
+zerocopy = { workspace = true }
+memmap2 = { workspace = true }
+tracing = { workspace = true }

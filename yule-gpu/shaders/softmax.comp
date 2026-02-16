@@ -1,0 +1,53 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Input { float input_data[]; };
+layout(set = 0, binding = 1) buffer Out { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint size;
+};
+
+shared float shared_data[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_size = gl_WorkGroupSize.x;
+
+    // Max reduction
+    float local_max = -1.0e30;
+    for (uint i = tid; i < size; i += wg_size) {
+        local_max = max(local_max, input_data[i]);
+    }
+    shared_data[tid] = local_max;
+    barrier();
+
+    for (uint s = wg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_data[tid] = max(shared_data[tid], shared_data[tid + s]);
+        barrier();
+    }
+    float max_val = shared_data[0];
+    barrier();
+
+    // Exp + sum reduction
+    float local_sum = 0.0;
+    for (uint i = tid; i < size; i += wg_size) {
+        float e = exp(input_data[i] - max_val);
+        out_data[i] = e;
+        local_sum += e;
+    }
+    shared_data[tid] = local_sum;
+    barrier();
+
+    for (uint s = wg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_data[tid] += shared_data[tid + s];
+        barrier();
+    }
+    float inv_sum = 1.0 / shared_data[0];
+    barrier();
+
+    for (uint i = tid; i < size; i += wg_size) {
+        out_data[i] *= inv_sum;
+    }
+}

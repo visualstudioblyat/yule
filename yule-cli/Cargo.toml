@@ -1,0 +1,33 @@
+[package]
+name = "yule"
+description = "Local AI inference runtime — verified models, sandboxed execution, signed audit logs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "yule"
+path = "src/main.rs"
+
+[dependencies]
+yule-core = { workspace = true }
+yule-verify = { workspace = true }
+yule-registry = { workspace = true }
+yule-sandbox = { workspace = true }
+yule-gpu = { workspace = true }
+yule-infer = { workspace = true }
+yule-attest = { workspace = true }
+yule-api = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+memmap2 = { workspace = true }
+blake3 = { workspace = true }
+
+[features]
+default = []
+vulkan = ["yule-gpu/vulkan", "yule-infer/vulkan"]

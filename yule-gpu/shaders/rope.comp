@@ -1,0 +1,60 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer Q { float q[]; };
+layout(set = 0, binding = 1) buffer K { float k[]; };
+layout(set = 0, binding = 2) buffer Q2 { float q2[]; }; // reserved
+layout(set = 0, binding = 3) buffer K2 { float k2[]; }; // reserved
+
+layout(push_constant) uniform Params {
+    uint pos;
+    uint head_dim;
+    uint freq_base_bits;
+    uint n_heads_q;
+    uint n_heads_k;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint half_dim = head_dim / 2;
+    uint total_q = n_heads_q * half_dim;
+    uint total_k = n_heads_k * half_dim;
+
+    if (idx >= total_q + total_k) return;
+
+    float freq_base = uintBitsToFloat(freq_base_bits);
+
+    if (idx < total_q) {
+        // Rotate Q head — interleaved layout: pairs at (2i, 2i+1)
+        uint pair_idx = idx % half_dim;
+        uint head = idx / half_dim;
+        uint base_off = head * head_dim;
+
+        float freq = 1.0 / pow(freq_base, float(2 * pair_idx) / float(head_dim));
+        float angle = float(pos) * freq;
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+
+        float q0 = q[base_off + 2 * pair_idx];
+        float q1 = q[base_off + 2 * pair_idx + 1];
+        q[base_off + 2 * pair_idx]     = q0 * cos_a - q1 * sin_a;
+        q[base_off + 2 * pair_idx + 1] = q0 * sin_a + q1 * cos_a;
+    } else {
+        // Rotate K head — interleaved layout
+        uint k_idx = idx - total_q;
+        uint pair_idx = k_idx % half_dim;
+        uint head = k_idx / half_dim;
+        uint base_off = head * head_dim;
+
+        float freq = 1.0 / pow(freq_base, float(2 * pair_idx) / float(head_dim));
+        float angle = float(pos) * freq;
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+
+        float k0 = k[base_off + 2 * pair_idx];
+        float k1 = k[base_off + 2 * pair_idx + 1];
+        k[base_off + 2 * pair_idx]     = k0 * cos_a - k1 * sin_a;
+        k[base_off + 2 * pair_idx + 1] = k0 * sin_a + k1 * cos_a;
+    }
+}

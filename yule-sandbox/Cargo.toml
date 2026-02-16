@@ -1,0 +1,25 @@
+[package]
+name = "yule-sandbox"
+description = "Cross-platform process sandboxing: seccomp, AppContainer, seatbelt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+yule-core = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# linux sandboxing (seccomp, namespaces, landlock)
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Foundation"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macos sandboxing (seatbelt profiles)

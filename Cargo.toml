@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = [
+    "yule-core",
+    "yule-verify",
+    "yule-registry",
+    "yule-sandbox",
+    "yule-gpu",
+    "yule-infer",
+    "yule-attest",
+    "yule-api",
+    "yule-cli",
+    "yule-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/visualstudioblyat/yule"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal crates
+yule-core = { path = "yule-core", version = "0.1.0" }
+yule-verify = { path = "yule-verify", version = "0.1.0" }
+yule-registry = { path = "yule-registry", version = "0.1.0" }
+yule-sandbox = { path = "yule-sandbox", version = "0.1.0" }
+yule-gpu = { path = "yule-gpu", version = "0.1.0" }
+yule-infer = { path = "yule-infer", version = "0.1.0" }
+yule-attest = { path = "yule-attest", version = "0.1.0" }
+yule-api = { path = "yule-api", version = "0.1.0" }
+
+# error handling
+thiserror = "2"
+anyhow = "1"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# async runtime
+tokio = { version = "1", features = ["full"] }
+
+# crypto
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["serde"] }
+sha2 = "0.10"
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# cli
+clap = { version = "4", features = ["derive"] }
+
+# web server
+axum = "0.8"
+
+# memory mapping
+memmap2 = "0.9"
+
+# entropy
+getrandom = "0.3"
+
+# http client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+
+# streaming
+tokio-stream = "0.1"
+
+# gpu compute
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+
+# byte manipulation
+bytemuck = { version = "1", features = ["derive"] }
+zerocopy = { version = "0.8", features = ["derive"] }
+
+# testing
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

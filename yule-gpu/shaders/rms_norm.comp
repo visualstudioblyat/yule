@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Input { float input_data[]; };
+layout(set = 0, binding = 1) buffer Weight { float weight[]; };
+layout(set = 0, binding = 2) buffer Out { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint size;
+    float eps;
+};
+
+shared float partial_sums[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_size = gl_WorkGroupSize.x;
+
+    float sum = 0.0;
+    for (uint i = tid; i < size; i += wg_size) {
+        float v = input_data[i];
+        sum += v * v;
+    }
+    partial_sums[tid] = sum;
+    barrier();
+
+    for (uint s = wg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_sums[tid] += partial_sums[tid + s];
+        }
+        barrier();
+    }
+
+    float inv_rms = 1.0 / sqrt(partial_sums[0] / float(size) + eps);
+    barrier();
+
+    for (uint i = tid; i < size; i += wg_size) {
+        out_data[i] = input_data[i] * inv_rms * weight[i];
+    }
+}

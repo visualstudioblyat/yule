@@ -1,0 +1,20 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer EmbedTable { float embed_table[]; };
+layout(set = 0, binding = 1) buffer TokenIds { uint token_ids[]; };
+layout(set = 0, binding = 2) buffer Out { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint embed_dim;
+    uint token_idx; // which token in the batch to look up
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= embed_dim) return;
+
+    uint tok = token_ids[token_idx];
+    out_data[idx] = embed_table[tok * embed_dim + idx];
+}

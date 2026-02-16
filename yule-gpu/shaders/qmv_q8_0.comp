@@ -1,0 +1,78 @@
+#version 450
+
+// Q8_0: 34 bytes/block = f16 scale + 32 x int8 quants. One workgroup per row.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Weights { uint weight_data[]; };
+layout(set = 0, binding = 1) buffer Input { float input_data[]; };
+layout(set = 0, binding = 2) buffer Out { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint n_rows;
+    uint n_cols;
+    uint blocks_per_row;
+};
+
+shared float partial_sums[256];
+
+float unpack_f16(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) {
+        float val = ldexp(float(mant), -24);
+        return sign == 1u ? -val : val;
+    }
+    if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+    float val = ldexp(float(mant | 0x400u), int(exp) - 25);
+    return sign == 1u ? -val : val;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= n_rows) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint row_byte_offset = row * blocks_per_row * 34u;
+    float sum = 0.0;
+
+    for (uint block = tid; block < blocks_per_row; block += gl_WorkGroupSize.x) {
+        uint boff = row_byte_offset + block * 34u;
+
+        uint sw = boff / 4u;
+        uint sb = boff % 4u;
+        uint raw = weight_data[sw];
+        uint f16_bits;
+        if (sb == 0u)      f16_bits = raw & 0xFFFFu;
+        else if (sb == 2u) f16_bits = (raw >> 16) & 0xFFFFu;
+        else {
+            uint next = weight_data[sw + 1u];
+            f16_bits = ((raw >> (sb * 8u)) | (next << (32u - sb * 8u))) & 0xFFFFu;
+        }
+        float scale = unpack_f16(f16_bits);
+
+        uint qoff = boff + 2u;
+        uint col_base = block * 32u;
+
+        for (uint j = 0u; j < 32u; j++) {
+            uint bi = qoff + j;
+            uint word = weight_data[bi / 4u];
+            uint byte_val = (word >> ((bi % 4u) * 8u)) & 0xFFu;
+
+            int q = int(byte_val);
+            if (q >= 128) q -= 256;
+
+            uint c = col_base + j;
+            if (c < n_cols) sum += scale * float(q) * input_data[c];
+        }
+    }
+
+    partial_sums[tid] = sum;
+    barrier();
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) partial_sums[tid] += partial_sums[tid + s];
+        barrier();
+    }
+    if (tid == 0) out_data[row] = partial_sums[0];
+}

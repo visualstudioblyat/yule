@@ -1,0 +1,120 @@
+#version 450
+
+// Q4_K: 144 bytes/super-block = 256 weights.
+// Layout: f16 d (2B) + f16 dmin (2B) + scales[12] (12B) + quants[128] (128B)
+// scales[12] encodes 8 sub-block scales and 8 sub-block mins (6 bits each).
+// Quants are grouped: 4 groups of 64 weights, each group = 32 bytes.
+// Low nibble = first 32 weights, high nibble = next 32 weights.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Weights { uint weight_data[]; };
+layout(set = 0, binding = 1) buffer Input { float input_data[]; };
+layout(set = 0, binding = 2) buffer Out { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint n_rows;
+    uint n_cols;
+    uint blocks_per_row;
+};
+
+shared float partial_sums[256];
+
+float unpack_f16(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) {
+        float val = ldexp(float(mant), -24);
+        return sign == 1u ? -val : val;
+    }
+    if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+    float val = ldexp(float(mant | 0x400u), int(exp) - 25);
+    return sign == 1u ? -val : val;
+}
+
+uint read_byte(uint byte_addr) {
+    uint word = weight_data[byte_addr / 4u];
+    return (word >> ((byte_addr % 4u) * 8u)) & 0xFFu;
+}
+
+uint read_u16(uint byte_addr) {
+    return read_byte(byte_addr) | (read_byte(byte_addr + 1u) << 8u);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= n_rows) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint row_byte_offset = row * blocks_per_row * 144u;
+    float sum = 0.0;
+
+    for (uint blk = tid; blk < blocks_per_row; blk += gl_WorkGroupSize.x) {
+        uint boff = row_byte_offset + blk * 144u;
+
+        float d    = unpack_f16(read_u16(boff));
+        float dmin = unpack_f16(read_u16(boff + 2u));
+
+        // Read 12 raw scale bytes: q[0..11]
+        uint q[12];
+        for (uint i = 0u; i < 12u; i++) {
+            q[i] = read_byte(boff + 4u + i);
+        }
+
+        // Extract 6-bit scales and mins matching ggml get_scale_min_k4():
+        //   j < 4:  sc[j] = q[j] & 63,        mn[j] = q[j+4] & 63
+        //   j >= 4: sc[j] = (q[j+4]&0xF) | ((q[j-4]>>6)<<4)
+        //           mn[j] = (q[j+4]>>4)  | ((q[j]>>6)<<4)
+        uint sc8[8];
+        uint mn8[8];
+        for (uint j = 0u; j < 4u; j++) {
+            sc8[j] = q[j] & 63u;
+            mn8[j] = q[j + 4u] & 63u;
+        }
+        for (uint j = 4u; j < 8u; j++) {
+            sc8[j] = (q[j + 4u] & 0xFu) | ((q[j - 4u] >> 6u) << 4u);
+            mn8[j] = (q[j + 4u] >> 4u)  | ((q[j] >> 6u) << 4u);
+        }
+
+        uint quant_off = boff + 16u;
+        uint col_base = blk * 256u;
+
+        // 4 groups of 64 weights, each group = 32 bytes of quants
+        for (uint grp = 0u; grp < 4u; grp++) {
+            uint qs_off = quant_off + grp * 32u;
+
+            // Sub-block 2*grp: low nibbles (first 32 weights)
+            uint sb0 = 2u * grp;
+            float scale0 = d * float(sc8[sb0]);
+            float min0   = dmin * float(mn8[sb0]);
+            for (uint l = 0u; l < 32u; l++) {
+                uint c = col_base + 64u * grp + l;
+                if (c < n_cols) {
+                    float qval = float(read_byte(qs_off + l) & 0xFu);
+                    sum += (qval * scale0 - min0) * input_data[c];
+                }
+            }
+
+            // Sub-block 2*grp+1: high nibbles (next 32 weights)
+            uint sb1 = 2u * grp + 1u;
+            float scale1 = d * float(sc8[sb1]);
+            float min1   = dmin * float(mn8[sb1]);
+            for (uint l = 0u; l < 32u; l++) {
+                uint c = col_base + 64u * grp + 32u + l;
+                if (c < n_cols) {
+                    float qval = float((read_byte(qs_off + l) >> 4u) & 0xFu);
+                    sum += (qval * scale1 - min1) * input_data[c];
+                }
+            }
+        }
+    }
+
+    partial_sums[tid] = sum;
+    barrier();
+    for (uint s = gl_WorkGroupSize.x / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) partial_sums[tid] += partial_sums[tid + s];
+        barrier();
+    }
+    if (tid == 0u) out_data[row] = partial_sums[0];
+}

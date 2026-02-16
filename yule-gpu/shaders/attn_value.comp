@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Weights { float attn_weights[]; };
+layout(set = 0, binding = 1) buffer ValueCache { float value_cache[]; };
+layout(set = 0, binding = 2) buffer Out { float out_data[]; };
+layout(set = 0, binding = 3) buffer Scratch { float scratch[]; };
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint seq_len;
+    uint kv_offset;     // offset within each position for this KV head
+    uint kv_stride;     // total elements per position in KV cache
+    uint out_offset;    // write offset into output buffer for this head
+};
+
+shared float partial_sums[256];
+
+void main() {
+    uint dim_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (dim_idx >= head_dim) return;
+
+    float sum = 0.0;
+    for (uint pos = tid; pos < seq_len; pos += gl_WorkGroupSize.x) {
+        sum += attn_weights[pos] * value_cache[pos * kv_stride + kv_offset + dim_idx];
+    }
+
+    partial_sums[tid] = sum;
+    barrier();
+
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) partial_sums[tid] += partial_sums[tid + s];
+        barrier();
+    }
+
+    if (tid == 0) {
+        out_data[out_offset + dim_idx] = partial_sums[0];
+    }
+}

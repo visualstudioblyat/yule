@@ -1,0 +1,18 @@
+/target
+Cargo.lock
+*.swp
+*.swo
+.DS_Store
+
+# model files (large binaries)
+models/
+*.gguf
+
+# docs build artifacts
+yule-docs/.next/
+yule-docs/node_modules/
+yule-docs/.source/
+
+# OS junk
+Thumbs.db
+nul
