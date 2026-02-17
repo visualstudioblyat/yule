@@ -116,13 +116,20 @@ fn main() {
             max_tokens,
             temperature,
             backend,
-            no_sandbox: _,
+            no_sandbox,
         } => {
             let prompt = prompt.unwrap_or_else(|| {
                 eprintln!("error: --prompt is required");
                 std::process::exit(1);
             });
-            if let Err(e) = cmd_run(&model, &prompt, max_tokens, temperature, &backend) {
+            if let Err(e) = cmd_run(
+                &model,
+                &prompt,
+                max_tokens,
+                temperature,
+                &backend,
+                no_sandbox,
+            ) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -374,7 +381,7 @@ fn cmd_serve(
         };
         match sandbox.apply_to_current_process(&config) {
             Ok(guard) => {
-                eprintln!("sandbox: active (job object, 32GB memory limit)");
+                eprintln!("sandbox: active (32GB memory limit)");
                 Some(guard)
             }
             Err(e) => {
@@ -399,8 +406,32 @@ fn cmd_run(
     max_tokens: u32,
     temperature: f32,
     backend: &str,
+    no_sandbox: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let path = resolve_model_path(model_path)?;
+
+    let _sandbox_guard = if no_sandbox {
+        eprintln!("sandbox: disabled");
+        None
+    } else {
+        let sandbox = yule_sandbox::create_sandbox();
+        let config = yule_sandbox::SandboxConfig {
+            model_path: path.to_path_buf(),
+            allow_gpu: backend != "cpu",
+            max_memory_bytes: 32 * 1024 * 1024 * 1024, // 32 GB
+            allow_network: false,
+        };
+        match sandbox.apply_to_current_process(&config) {
+            Ok(guard) => {
+                eprintln!("sandbox: active (32GB memory limit)");
+                Some(guard)
+            }
+            Err(e) => {
+                eprintln!("sandbox: failed to apply ({e}), continuing without sandbox");
+                None
+            }
+        }
+    };
 
     // 1. parse GGUF
     let start = Instant::now();

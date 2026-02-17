@@ -15,7 +15,7 @@
 </p>
 Local AI inference runtime written from scratch in pure Rust. No bindings to llama.cpp, no CUDA dependency, no C++ anywhere in the stack.
 
-**Beta** — 2.5 months of solo development. Correctness-validated on TinyLlama 1.1B (CPU + Vulkan). Actively developing multi-model support and Linux sandboxing.
+**Beta** — 2.5 months of solo development. Correctness-validated on TinyLlama 1.1B (CPU + Vulkan). Actively developing multi-model support.
 
 ## What this is
 
@@ -24,7 +24,7 @@ A from-scratch implementation of transformer inference with cryptographic integr
 - **Pure Rust GGUF parser** — no `unsafe` in parsing code, no C++ string handling CVEs
 - **11 hand-written Vulkan compute shaders** — raw GLSL 450 compiled to SPIR-V, fused dequant+dot-product directly from quantized weight blocks. Includes a Q4_K shader that unpacks 144-byte super-blocks with 6-bit scale extraction from a sharded 12-byte metadata array. No cuBLAS, no GGML backend, no abstraction layers
 - **Merkle verification** — blake3 hash tree over every tensor in the model file. If a single weight is modified, the root hash changes
-- **Kernel-level process sandbox** — Windows Job Objects with no child processes, no clipboard access, no UI permissions. The model process cannot touch the host
+- **Kernel-level process sandbox** — Windows Job Objects, Linux seccomp-BPF + Landlock. No child processes, no filesystem access, no escape. The model process cannot touch the host
 - **Signed audit trail** — Ed25519-signed, hash-chained attestation records for every inference. Cryptographically tamper-evident
 - **8.5× GPU speedup** — hand-tuned Vulkan path vs scalar CPU on Q4_K_M. No NVIDIA lock-in
 
@@ -125,7 +125,7 @@ Vulkan GPU: Q4_0, Q4_K, Q8_0 — hand-written compute shaders, no framework depe
 | `yule-gpu` | ComputeBackend trait, Vulkan backend (ash + gpu-allocator), 11 SPIR-V shaders |
 | `yule-verify` | blake3 merkle trees, Ed25519 signatures, model manifests |
 | `yule-attest` | Hash-chained attestation records, device key management |
-| `yule-sandbox` | Windows Job Object isolation (Linux seccomp, macOS seatbelt planned) |
+| `yule-sandbox` | Windows Job Objects, Linux seccomp-BPF + Landlock (macOS seatbelt planned) |
 | `yule-api` | Axum server, capability-token auth, SSE streaming, OpenAI-compat |
 | `yule-registry` | HuggingFace model pull, local cache, quant detection |
 | `yule-cli` | CLI entry point |

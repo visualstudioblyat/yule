@@ -2,6 +2,26 @@
 
 ---
 
+## v0.3.2
+
+**2026-02-17**
+
+Linux sandbox implementation. The inference process is now sandboxed on both Windows and Linux.
+
+### Added
+
+- **Linux seccomp-BPF** — syscall allowlist with ~60 base syscalls. Conditional networking (for `yule serve`) and GPU ioctl access. Default deny returns EPERM.
+- **Linux Landlock** — filesystem restricted to model path (read-only), GPU device nodes, and essential system libraries. Graceful degradation on kernels < 5.13.
+- **Linux rlimit** — `RLIMIT_AS` caps virtual memory, matching Windows memory limit behavior.
+- **`yule run` sandbox** — the `run` command now applies sandboxing (was previously ignored). Uses `allow_network: false`, GPU access based on backend selection.
+- 5 new Linux sandbox tests (rlimit roundtrip, seccomp filter construction, conditional syscall verification). Total: 103 tests.
+
+### Changed
+
+- Sandbox log messages are now platform-agnostic.
+
+---
+
 ## v0.3.1
 
 **2026-02-15**
