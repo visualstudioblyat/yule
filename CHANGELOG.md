@@ -2,6 +2,20 @@
 
 ---
 
+## v0.3.3
+
+**2026-02-17**
+
+macOS Seatbelt sandbox. All three platforms (Windows, Linux, macOS) now have kernel-level process sandboxing.
+
+### Added
+
+- **macOS Seatbelt** — `sandbox_init()` with dynamically-built SBPL profile. Default deny, model path read-only, system libraries allowed. Conditional GPU (I/O Kit) and network access.
+- **macOS rlimit** — `RLIMIT_AS` caps virtual memory, matching Linux and Windows behavior.
+- 4 new macOS sandbox tests (profile string construction, conditional GPU/network rules). Total: 107 tests.
+
+---
+
 ## v0.3.2
 
 **2026-02-17**
