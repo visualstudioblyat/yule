@@ -8,7 +8,7 @@ use std::ptr;
 // FFI: macOS Seatbelt (sandbox_init / sandbox_free_error)
 // ---------------------------------------------------------------------------
 
-extern "C" {
+unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
     fn sandbox_free_error(errorbuf: *mut c_char);
 }
