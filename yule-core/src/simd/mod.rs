@@ -4,28 +4,30 @@ pub mod scalar;
 pub mod avx2;
 
 use crate::dtype::DType;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 static LEVEL: AtomicU8 = AtomicU8::new(0);
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const SCALAR: u8 = 1;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const AVX2: u8 = 2;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn dispatch_level() -> u8 {
     let l = LEVEL.load(Relaxed);
     if l != 0 {
         return l;
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let detected = if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
         AVX2
     } else {
         SCALAR
     };
-
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    let detected = SCALAR;
 
     LEVEL.store(detected, Relaxed);
     detected
