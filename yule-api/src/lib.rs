@@ -2,6 +2,8 @@ pub mod auth;
 pub mod inference;
 pub mod routes;
 pub mod types;
+#[cfg(kani)]
+mod verification;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

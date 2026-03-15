@@ -1,5 +1,7 @@
 pub mod log;
 pub mod session;
+#[cfg(kani)]
+mod verification;
 
 use serde::{Deserialize, Serialize};
 
