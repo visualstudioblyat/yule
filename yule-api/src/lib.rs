@@ -149,7 +149,7 @@ mod hex {
     }
 }
 
-fn build_router(state: Arc<AppState>, auth: Arc<TokenAuthority>) -> Router {
+pub fn build_router(state: Arc<AppState>, auth: Arc<TokenAuthority>) -> Router {
     use routes::{native, openai_compat};
 
     Router::new()

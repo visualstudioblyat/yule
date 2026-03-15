@@ -15,3 +15,6 @@ bytemuck = { workspace = true }
 zerocopy = { workspace = true }
 memmap2 = { workspace = true }
 tracing = { workspace = true }
+
+[build-dependencies]
+cc = "1"

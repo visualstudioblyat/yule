@@ -25,3 +25,8 @@ ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 tokio-stream = { workspace = true }
 memmap2 = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+hyper = "1"

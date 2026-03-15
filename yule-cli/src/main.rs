@@ -31,7 +31,7 @@ enum Commands {
         #[arg(long, default_value = "0.7")]
         temperature: f32,
 
-        /// Compute backend: auto, cpu, vulkan
+        /// Compute backend: auto, cpu, vulkan, cuda, metal
         #[arg(long, default_value = "auto")]
         backend: String,
 

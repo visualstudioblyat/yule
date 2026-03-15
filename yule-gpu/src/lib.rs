@@ -9,6 +9,12 @@ pub mod vulkan;
 #[cfg(feature = "vulkan")]
 pub use ash::vk;
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
+#[cfg(feature = "metal-gpu")]
+pub mod metal;
+
 use yule_core::error::Result;
 
 #[allow(clippy::too_many_arguments)]
@@ -148,9 +154,19 @@ pub enum BackendKind {
 pub fn detect_backends() -> Vec<BackendKind> {
     let mut backends = vec![BackendKind::Cpu];
 
+    #[cfg(feature = "metal-gpu")]
+    if metal::MetalBackend::is_available() {
+        backends.push(BackendKind::Metal);
+    }
+
     #[cfg(feature = "vulkan")]
     if vulkan::VulkanBackend::is_available() {
         backends.push(BackendKind::Vulkan);
+    }
+
+    #[cfg(feature = "cuda")]
+    if cuda::CudaBackend::is_available() {
+        backends.push(BackendKind::Cuda);
     }
 
     backends
@@ -162,6 +178,10 @@ pub fn create_backend(kind: BackendKind) -> Result<Box<dyn ComputeBackend>> {
         BackendKind::Cpu => Ok(Box::new(cpu::CpuBackend::new())),
         #[cfg(feature = "vulkan")]
         BackendKind::Vulkan => Ok(Box::new(vulkan::VulkanBackend::new()?)),
+        #[cfg(feature = "cuda")]
+        BackendKind::Cuda => Ok(Box::new(cuda::CudaBackend::new()?)),
+        #[cfg(feature = "metal-gpu")]
+        BackendKind::Metal => Ok(Box::new(metal::MetalBackend::new()?)),
         _ => Err(yule_core::error::YuleError::Gpu(format!(
             "backend {kind:?} not compiled in — enable the feature flag"
         ))),

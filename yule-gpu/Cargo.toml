@@ -15,10 +15,14 @@ bytemuck = { workspace = true }
 
 ash = { workspace = true, optional = true }
 gpu-allocator = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.30", optional = true }
 
 [features]
 default = ["cpu"]
 cpu = []
 vulkan = ["dep:ash", "dep:gpu-allocator"]
-cuda = []
-metal = []
+cuda = ["dep:cudarc"]
+metal-gpu = ["dep:metal"]

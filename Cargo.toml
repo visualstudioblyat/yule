@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/visualstudioblyat/yule"
@@ -22,14 +22,14 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # internal crates
-yule-core = { path = "yule-core", version = "0.1.0" }
-yule-verify = { path = "yule-verify", version = "0.1.0" }
-yule-registry = { path = "yule-registry", version = "0.1.0" }
-yule-sandbox = { path = "yule-sandbox", version = "0.1.0" }
-yule-gpu = { path = "yule-gpu", version = "0.1.0" }
-yule-infer = { path = "yule-infer", version = "0.1.0" }
-yule-attest = { path = "yule-attest", version = "0.1.0" }
-yule-api = { path = "yule-api", version = "0.1.0" }
+yule-core = { path = "yule-core", version = "0.4.0" }
+yule-verify = { path = "yule-verify", version = "0.4.0" }
+yule-registry = { path = "yule-registry", version = "0.4.0" }
+yule-sandbox = { path = "yule-sandbox", version = "0.4.0" }
+yule-gpu = { path = "yule-gpu", version = "0.4.0" }
+yule-infer = { path = "yule-infer", version = "0.4.0" }
+yule-attest = { path = "yule-attest", version = "0.4.0" }
+yule-api = { path = "yule-api", version = "0.4.0" }
 
 # error handling
 thiserror = "2"
@@ -72,6 +72,7 @@ tokio-stream = "0.1"
 # gpu compute
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }
 gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+cudarc = { version = "0.12", default-features = false }
 
 # byte manipulation
 bytemuck = { version = "1", features = ["derive"] }

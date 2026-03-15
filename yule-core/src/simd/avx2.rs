@@ -82,10 +82,25 @@ unsafe fn vec_dot_q4_0_avx2(block: &[u8], act: &[f32]) -> f32 {
     }
 }
 
-/// Q4_K: 256-weight super-block. 8 sub-blocks of 32, grouped nibbles.
-/// Accumulates scale*dot - min*act_sum per sub-block using FMA.
+/// Q4_K: 256-weight super-block.
+/// Uses hand-tuned assembly kernel when available, otherwise Rust SIMD fallback.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vec_dot_q4_k_avx2(block: &[u8], act: &[f32]) -> f32 {
+    #[cfg(has_asm_kernels)]
+    {
+        unsafe { crate::kernels::vec_dot_q4_k_asm(block, act) }
+    }
+    #[cfg(not(has_asm_kernels))]
+    {
+        // Rust SIMD fallback: extract scales/mins, process 8 sub-blocks
+        unsafe { vec_dot_q4_k_avx2_rust(block, act) }
+    }
+}
+
+/// Rust AVX2 fallback for Q4_K when assembly kernel is not compiled.
+#[cfg(not(has_asm_kernels))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q4_k_avx2_rust(block: &[u8], act: &[f32]) -> f32 {
     unsafe {
         let d = crate::dequant::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let dmin = crate::dequant::f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
@@ -95,51 +110,43 @@ unsafe fn vec_dot_q4_k_avx2(block: &[u8], act: &[f32]) -> f32 {
         let (sc, mn) = crate::dequant::extract_q4k_scales_mins(&scales_arr);
 
         let mut sum = 0.0f32;
-
         for j in 0..4 {
-            let qs = &block[16 + 32 * j..];
+            let ql = &block[16 + 32 * j..];
 
-            // sub-block 2*j: low nibbles → act[64*j .. 64*j+32]
-            let sb0 = 2 * j;
-            let scale0 = d * sc[sb0] as f32;
-            let min0 = dmin * mn[sb0] as f32;
+            // sub-block 2j: low nibbles
             let mut dot_acc = _mm256_setzero_ps();
             let mut sum_acc = _mm256_setzero_ps();
-
             for g in 0..4 {
                 let off = g * 8;
                 let mut w = [0.0f32; 8];
-                for i in 0..8 {
-                    w[i] = (qs[off + i] & 0x0F) as f32;
+                for l in 0..8 {
+                    w[l] = (ql[off + l] & 0xF) as f32;
                 }
                 let wv = _mm256_loadu_ps(w.as_ptr());
                 let a = _mm256_loadu_ps(act.as_ptr().add(64 * j + off));
                 dot_acc = _mm256_fmadd_ps(wv, a, dot_acc);
                 sum_acc = _mm256_add_ps(sum_acc, a);
             }
-            sum += scale0 * hsum_avx2(dot_acc) - min0 * hsum_avx2(sum_acc);
+            sum += d * sc[2 * j] as f32 * hsum_avx2(dot_acc)
+                - dmin * mn[2 * j] as f32 * hsum_avx2(sum_acc);
 
-            // sub-block 2*j+1: high nibbles → act[64*j+32 .. 64*j+64]
-            let sb1 = 2 * j + 1;
-            let scale1 = d * sc[sb1] as f32;
-            let min1 = dmin * mn[sb1] as f32;
+            // sub-block 2j+1: high nibbles
             dot_acc = _mm256_setzero_ps();
             sum_acc = _mm256_setzero_ps();
-
             for g in 0..4 {
                 let off = g * 8;
                 let mut w = [0.0f32; 8];
-                for i in 0..8 {
-                    w[i] = (qs[off + i] >> 4) as f32;
+                for l in 0..8 {
+                    w[l] = (ql[off + l] >> 4) as f32;
                 }
                 let wv = _mm256_loadu_ps(w.as_ptr());
                 let a = _mm256_loadu_ps(act.as_ptr().add(64 * j + 32 + off));
                 dot_acc = _mm256_fmadd_ps(wv, a, dot_acc);
                 sum_acc = _mm256_add_ps(sum_acc, a);
             }
-            sum += scale1 * hsum_avx2(dot_acc) - min1 * hsum_avx2(sum_acc);
+            sum += d * sc[2 * j + 1] as f32 * hsum_avx2(dot_acc)
+                - dmin * mn[2 * j + 1] as f32 * hsum_avx2(sum_acc);
         }
-
         sum
     }
 }

@@ -2,6 +2,43 @@
 
 ---
 
+## v0.4.0
+
+**2026-03-14**
+
+Multi-backend GPU support, hand-tuned assembly kernels, speculative decoding foundations, API integration tests, and comprehensive documentation updates. Yule is no longer Vulkan-only — CUDA and Metal backends are scaffolded with full `ComputeBackend` trait implementations, ready for kernel porting.
+
+### Added
+
+- **Q4_K hand-tuned x86-64 assembly kernel** — 790-line AVX2/FMA assembly (`q4k_gemv_avx2.S`) for the hottest dequant+dot path. Fused nibble extraction, f16→f32 conversion via `vcvtph2ps`, 8 sub-blocks fully unrolled. Cross-platform: Windows x64 ABI normalization, macOS symbol mangling, Linux ELF annotations. Linked via `cc` crate build script with `CLANG_PATH` env var support (no more hardcoded compiler path). FFI wrapper with debug assertions on buffer sizes.
+
+- **CUDA backend** (`yule-gpu/src/cuda/`) — `CudaBackend` implementing `ComputeBackend` via `cudarc` crate. Device discovery with SM count and VRAM reporting. Buffer management with `CudaSlice<u8>`, host↔device transfers, device-to-device copies via `cuMemcpyDtoD`. Feature-gated behind `cuda`. Compute kernels return stub errors pending PTX kernel implementation.
+
+- **Metal backend** (`yule-gpu/src/metal/`) — `MetalBackend` implementing `ComputeBackend` via `metal` crate. Device discovery with unified memory detection. `StorageModeShared` buffers for zero-copy on Apple Silicon. Blit command encoder for buffer copies. macOS-only, feature-gated behind `metal-gpu`. Compute kernels return stub errors pending MSL kernel implementation.
+
+- **Speculative decoding** (`yule-infer/src/speculative.rs`) — Rejection sampling implementation: `rejection_sample()` accepts draft tokens with probability `min(1, p_target/p_draft)`, resamples from `norm(max(0, p_target - p_draft))` on rejection. Guarantees output distribution exactly matches the target model. `logits_to_probs()` temperature-scaled softmax. `SpeculativeConfig` with LayerSkip strategy. 4 tests.
+
+- **API integration tests** (`yule-api/tests/integration.rs`) — 11 tests exercising the HTTP layer with a mock inference thread. Covers: auth rejection (no token, wrong token, missing Bearer prefix), valid auth, health endpoint (status, version, uptime, sandbox), model info (architecture, parameters, merkle root), tokenize, Yule chat with integrity/timing fields, OpenAI `/v1/models`, OpenAI `/v1/chat/completions`, 404 routing. Uses `tower::ServiceExt::oneshot` for in-process testing without binding a socket.
+
+- **2MB huge pages** — `mmap_model()` on Linux now tries explicit huge pages (`MAP_HUGETLB | MAP_HUGE_2MB`) before falling back to pre-faulted populate. Reduces TLB misses for large model files. Graceful fallback if `nr_hugepages` is not configured.
+
+- **macOS mmap pre-faulting** — `memmap2::populate()` now enabled on macOS (was Windows/Linux only).
+
+- **macOS CI** — GitHub Actions matrix expanded with `macos-latest` (ARM64, Apple Silicon) and `macos-13` (Intel x86_64). AVX2 code path validated on Intel macOS. ARM builds validate `cfg(target_arch)` gating compiles clean.
+
+### Changed
+
+- `build_router` in `yule-api` is now `pub` (was private), enabling integration test access.
+- `--backend` CLI flag now accepts `cuda` and `metal` in addition to `auto`, `cpu`, `vulkan`.
+- `detect_backends()` probes for Metal → Vulkan → CUDA in priority order (Metal preferred on Apple Silicon).
+- `create_backend()` dispatches to CUDA and Metal constructors behind feature flags.
+
+### Tests
+
+117 tests, 0 failures (up from 107). New: 11 API integration tests, 4 speculative decoding tests, 2 rejection sampling edge cases.
+
+---
+
 ## v0.3.3
 
 **2026-02-17**
