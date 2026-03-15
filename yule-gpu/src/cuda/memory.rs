@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use cudarc::driver::CudaSlice;
 use yule_core::error::{Result, YuleError};
 
-use crate::BufferHandle;
 use super::device::CudaDeviceWrapper;
+use crate::BufferHandle;
 
 pub struct CudaMemoryManager {
     buffers: Mutex<HashMap<u64, CudaSlice<u8>>>,
@@ -68,9 +68,9 @@ impl CudaMemoryManager {
         data: &mut [u8],
     ) -> Result<()> {
         let buffers = self.buffers.lock().unwrap();
-        let buf = buffers
-            .get(&handle.0)
-            .ok_or_else(|| YuleError::Gpu(format!("cuda copy_from: unknown buffer {}", handle.0)))?;
+        let buf = buffers.get(&handle.0).ok_or_else(|| {
+            YuleError::Gpu(format!("cuda copy_from: unknown buffer {}", handle.0))
+        })?;
 
         let host = device
             .inner()
@@ -119,12 +119,11 @@ impl CudaMemoryManager {
         // device-to-device copy via cuMemcpyDtoD
         use cudarc::driver::DeviceRepr;
         unsafe {
-            cudarc::driver::sys::lib()
-                .cuMemcpyDtoD_v2(
-                    *dst_slice.device_ptr() as u64,
-                    *src_slice.device_ptr() as u64,
-                    size,
-                );
+            cudarc::driver::sys::lib().cuMemcpyDtoD_v2(
+                *dst_slice.device_ptr() as u64,
+                *src_slice.device_ptr() as u64,
+                size,
+            );
         }
         Ok(())
     }

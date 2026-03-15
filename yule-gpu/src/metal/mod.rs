@@ -62,8 +62,7 @@ impl ComputeBackend for MetalBackend {
     }
 
     fn copy_buffer(&self, src: &BufferHandle, dst: &BufferHandle, size: usize) -> Result<()> {
-        self.memory
-            .copy_buffer(&self.device, src, dst, 0, 0, size)
+        self.memory.copy_buffer(&self.device, src, dst, 0, 0, size)
     }
 
     fn copy_buffer_offset(
@@ -93,11 +92,15 @@ impl ComputeBackend for MetalBackend {
         _n: u32,
         _k: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("metal matmul: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal matmul: kernel not yet implemented".into(),
+        ))
     }
 
     fn softmax(&self, _input: &BufferHandle, _output: &BufferHandle, _size: u32) -> Result<()> {
-        Err(YuleError::Gpu("metal softmax: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal softmax: kernel not yet implemented".into(),
+        ))
     }
 
     fn rms_norm(
@@ -108,7 +111,9 @@ impl ComputeBackend for MetalBackend {
         _size: u32,
         _eps: f32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("metal rms_norm: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal rms_norm: kernel not yet implemented".into(),
+        ))
     }
 
     fn rope(
@@ -121,11 +126,15 @@ impl ComputeBackend for MetalBackend {
         _n_heads_q: u32,
         _n_heads_k: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("metal rope: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal rope: kernel not yet implemented".into(),
+        ))
     }
 
     fn silu(&self, _input: &BufferHandle, _output: &BufferHandle, _size: u32) -> Result<()> {
-        Err(YuleError::Gpu("metal silu: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal silu: kernel not yet implemented".into(),
+        ))
     }
 
     fn element_mul(
@@ -135,7 +144,9 @@ impl ComputeBackend for MetalBackend {
         _output: &BufferHandle,
         _size: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("metal element_mul: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal element_mul: kernel not yet implemented".into(),
+        ))
     }
 
     fn add(
@@ -145,7 +156,9 @@ impl ComputeBackend for MetalBackend {
         _output: &BufferHandle,
         _size: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("metal add: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal add: kernel not yet implemented".into(),
+        ))
     }
 
     fn attn_score(
@@ -159,7 +172,9 @@ impl ComputeBackend for MetalBackend {
         _kv_offset: u32,
         _kv_stride: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("metal attn_score: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal attn_score: kernel not yet implemented".into(),
+        ))
     }
 
     fn attn_value(
@@ -173,7 +188,9 @@ impl ComputeBackend for MetalBackend {
         _kv_stride: u32,
         _out_offset: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("metal attn_value: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal attn_value: kernel not yet implemented".into(),
+        ))
     }
 
     fn quantized_matmul(
@@ -185,6 +202,8 @@ impl ComputeBackend for MetalBackend {
         _n_cols: u32,
         _dtype: yule_core::dtype::DType,
     ) -> Result<()> {
-        Err(YuleError::Gpu("metal quantized_matmul: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "metal quantized_matmul: kernel not yet implemented".into(),
+        ))
     }
 }

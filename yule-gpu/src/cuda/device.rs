@@ -27,8 +27,11 @@ impl CudaDeviceWrapper {
             .map_err(|e| YuleError::Gpu(format!("cuda mem_info failed: {e}")))?;
 
         let sm_count = device
-            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
-            .map_err(|e| YuleError::Gpu(format!("cuda attribute query failed: {e}")))? as u32;
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .map_err(|e| YuleError::Gpu(format!("cuda attribute query failed: {e}")))?
+            as u32;
 
         tracing::info!(
             name = %device_name,

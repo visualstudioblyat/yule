@@ -30,6 +30,9 @@ unsafe extern "C" {
 #[inline]
 pub unsafe fn vec_dot_q4_k_asm(block: &[u8], act: &[f32]) -> f32 {
     debug_assert!(block.len() >= 144, "Q4_K block must be at least 144 bytes");
-    debug_assert!(act.len() >= 256, "Q4_K activations must be at least 256 floats");
+    debug_assert!(
+        act.len() >= 256,
+        "Q4_K activations must be at least 256 floats"
+    );
     unsafe { yule_q4k_gemv_avx2(block.as_ptr(), act.as_ptr()) }
 }

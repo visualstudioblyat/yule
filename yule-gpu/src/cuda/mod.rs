@@ -94,11 +94,15 @@ impl ComputeBackend for CudaBackend {
         _n: u32,
         _k: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("cuda matmul: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda matmul: kernel not yet implemented".into(),
+        ))
     }
 
     fn softmax(&self, _input: &BufferHandle, _output: &BufferHandle, _size: u32) -> Result<()> {
-        Err(YuleError::Gpu("cuda softmax: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda softmax: kernel not yet implemented".into(),
+        ))
     }
 
     fn rms_norm(
@@ -109,7 +113,9 @@ impl ComputeBackend for CudaBackend {
         _size: u32,
         _eps: f32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("cuda rms_norm: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda rms_norm: kernel not yet implemented".into(),
+        ))
     }
 
     fn rope(
@@ -122,11 +128,15 @@ impl ComputeBackend for CudaBackend {
         _n_heads_q: u32,
         _n_heads_k: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("cuda rope: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda rope: kernel not yet implemented".into(),
+        ))
     }
 
     fn silu(&self, _input: &BufferHandle, _output: &BufferHandle, _size: u32) -> Result<()> {
-        Err(YuleError::Gpu("cuda silu: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda silu: kernel not yet implemented".into(),
+        ))
     }
 
     fn element_mul(
@@ -136,7 +146,9 @@ impl ComputeBackend for CudaBackend {
         _output: &BufferHandle,
         _size: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("cuda element_mul: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda element_mul: kernel not yet implemented".into(),
+        ))
     }
 
     fn add(
@@ -146,7 +158,9 @@ impl ComputeBackend for CudaBackend {
         _output: &BufferHandle,
         _size: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("cuda add: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda add: kernel not yet implemented".into(),
+        ))
     }
 
     fn attn_score(
@@ -160,7 +174,9 @@ impl ComputeBackend for CudaBackend {
         _kv_offset: u32,
         _kv_stride: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("cuda attn_score: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda attn_score: kernel not yet implemented".into(),
+        ))
     }
 
     fn attn_value(
@@ -174,7 +190,9 @@ impl ComputeBackend for CudaBackend {
         _kv_stride: u32,
         _out_offset: u32,
     ) -> Result<()> {
-        Err(YuleError::Gpu("cuda attn_value: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda attn_value: kernel not yet implemented".into(),
+        ))
     }
 
     fn quantized_matmul(
@@ -186,6 +204,8 @@ impl ComputeBackend for CudaBackend {
         _n_cols: u32,
         _dtype: yule_core::dtype::DType,
     ) -> Result<()> {
-        Err(YuleError::Gpu("cuda quantized_matmul: kernel not yet implemented".into()))
+        Err(YuleError::Gpu(
+            "cuda quantized_matmul: kernel not yet implemented".into(),
+        ))
     }
 }

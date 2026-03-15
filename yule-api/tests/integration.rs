@@ -5,7 +5,7 @@
 //! Generate requests with a fixed "Hello, world!" output and handles
 //! Tokenize requests with a dummy token list.
 
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -93,8 +93,7 @@ fn mock_state() -> (Arc<AppState>, String) {
             },
             tensor_count: 201,
             file_size: 637_000_000,
-            merkle_root: "ffc7e1fd6016a6f9ba2ca390a43681453a46ec6054f431aeb6244487932b0e65"
-                .into(),
+            merkle_root: "ffc7e1fd6016a6f9ba2ca390a43681453a46ec6054f431aeb6244487932b0e65".into(),
         },
         sandbox_active: true,
         device_pubkey: signing_key.verifying_key().to_bytes(),
@@ -247,7 +246,12 @@ async fn model_info_returns_metadata() {
     assert_eq!(json["layers"], 22);
     assert_eq!(json["vocab_size"], 32000);
     assert_eq!(json["tensor_count"], 201);
-    assert!(json["merkle_root"].as_str().unwrap().starts_with("ffc7e1fd"));
+    assert!(
+        json["merkle_root"]
+            .as_str()
+            .unwrap()
+            .starts_with("ffc7e1fd")
+    );
 }
 
 // ── Tokenize Endpoint ───────────────────────────────────────────────────────
@@ -405,7 +409,5 @@ async fn unknown_route_returns_404() {
 
     // Axum returns 401 because auth middleware runs before routing for unknown paths,
     // or 404 if auth passes. Either is acceptable.
-    assert!(
-        resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::UNAUTHORIZED
-    );
+    assert!(resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::UNAUTHORIZED);
 }

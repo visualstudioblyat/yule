@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(for dir:*)",
+      "Bash(for crate:*)",
+      "Bash(do echo:*)",
+      "Read(//c/Users/akrec/Desktop/yule/$crate/**)",
+      "Bash(done)",
+      "Bash(grep:*)",
+      "Bash(wc:*)",
+      "WebSearch",
+      "Bash(find:*)",
+      "Bash(cargo test:*)",
+      "Bash(cd:*)",
+      "Bash(curl:*)",
+      "Bash(export:*)",
+      "Bash(which cargo-kani:*)",
+      "Bash(cargo install:*)",
+      "Bash(gh repo:*)"
+    ]
+  }
+}

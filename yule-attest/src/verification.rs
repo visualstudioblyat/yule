@@ -102,7 +102,10 @@ mod proofs {
         };
         let pubkey = [0u8; 32];
         let result = record.verify_signature(&pubkey);
-        assert!(!result, "wrong-length signature must return false, never panic");
+        assert!(
+            !result,
+            "wrong-length signature must return false, never panic"
+        );
     }
 
     /// Prove: two records with different prev_hash produce different hashes.

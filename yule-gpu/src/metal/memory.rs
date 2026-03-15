@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use metal::Buffer as MTLBuffer;
 use yule_core::error::{Result, YuleError};
 
-use crate::BufferHandle;
 use super::device::MetalDeviceWrapper;
+use crate::BufferHandle;
 
 pub struct MetalMemoryManager {
     buffers: Mutex<HashMap<u64, MTLBuffer>>,
@@ -59,11 +59,9 @@ impl MetalMemoryManager {
 
     pub fn copy_from_device(&self, handle: &BufferHandle, data: &mut [u8]) -> Result<()> {
         let buffers = self.buffers.lock().unwrap();
-        let buf = buffers
-            .get(&handle.0)
-            .ok_or_else(|| {
-                YuleError::Gpu(format!("metal copy_from: unknown buffer {}", handle.0))
-            })?;
+        let buf = buffers.get(&handle.0).ok_or_else(|| {
+            YuleError::Gpu(format!("metal copy_from: unknown buffer {}", handle.0))
+        })?;
 
         let ptr = buf.contents() as *const u8;
         unsafe {

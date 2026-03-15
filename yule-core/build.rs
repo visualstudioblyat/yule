@@ -9,7 +9,9 @@ fn main() {
         let clang = std::env::var("CLANG_PATH").ok().or_else(find_clang);
 
         let Some(compiler) = clang else {
-            println!("cargo::warning=clang not found, skipping assembly kernels (using Rust SIMD fallback)");
+            println!(
+                "cargo::warning=clang not found, skipping assembly kernels (using Rust SIMD fallback)"
+            );
             return;
         };
 

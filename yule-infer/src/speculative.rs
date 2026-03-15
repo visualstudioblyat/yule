@@ -150,8 +150,7 @@ pub fn logits_to_probs(logits: &[f32], temperature: f32) -> Vec<f32> {
 /// Generate a random f32 in [0, 1) using OS CSPRNG.
 fn csprng_f32() -> Result<f32> {
     let mut bytes = [0u8; 4];
-    getrandom::fill(&mut bytes)
-        .map_err(|e| YuleError::Inference(format!("CSPRNG failed: {e}")))?;
+    getrandom::fill(&mut bytes).map_err(|e| YuleError::Inference(format!("CSPRNG failed: {e}")))?;
     let u = u32::from_le_bytes(bytes);
     Ok((u >> 8) as f32 / (1u32 << 24) as f32)
 }
@@ -216,6 +215,9 @@ mod tests {
                 assert!((resampled.unwrap() as usize) < target.len());
             }
         }
-        assert!(rejected > 80, "expected mostly rejections, got {rejected}/100");
+        assert!(
+            rejected > 80,
+            "expected mostly rejections, got {rejected}/100"
+        );
     }
 }
