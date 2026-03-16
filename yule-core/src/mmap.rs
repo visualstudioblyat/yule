@@ -75,7 +75,12 @@ pub fn mmap_model_with(path: &Path, opts: &MmapOptions) -> Result<memmap2::Mmap>
 fn try_huge_pages(file: &File) -> Option<memmap2::Mmap> {
     // Try explicit 2MB huge pages (MAP_HUGETLB | MAP_HUGE_2MB).
     // Requires `echo N > /proc/sys/vm/nr_hugepages` or CAP_IPC_LOCK.
-    match unsafe { memmap2::MmapOptions::new().huge(Some(21)).populate().map(file) } {
+    match unsafe {
+        memmap2::MmapOptions::new()
+            .huge(Some(21))
+            .populate()
+            .map(file)
+    } {
         Ok(m) => {
             tracing::debug!("mmap: explicit MAP_HUGETLB succeeded");
             Some(m)
@@ -251,12 +256,12 @@ fn prefetch_virtual_memory_win(mmap: &memmap2::Mmap) {
     }
 
     unsafe {
-        let kernel32 = LoadLibraryA(b"kernel32.dll\0".as_ptr());
+        let kernel32 = LoadLibraryA(c"kernel32.dll".as_ptr() as *const u8);
         if kernel32 == 0 {
             tracing::debug!("mmap: could not load kernel32 for PrefetchVirtualMemory");
             return;
         }
-        let proc = GetProcAddress(kernel32, b"PrefetchVirtualMemory\0".as_ptr());
+        let proc = GetProcAddress(kernel32, c"PrefetchVirtualMemory".as_ptr() as *const u8);
         if proc.is_null() {
             tracing::debug!("mmap: PrefetchVirtualMemory not available on this Windows version");
             return;

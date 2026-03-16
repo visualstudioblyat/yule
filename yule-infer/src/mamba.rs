@@ -23,7 +23,7 @@ use crate::model_runner::ModelRunner;
 use crate::weight_loader::WeightStore;
 use yule_core::dequant;
 use yule_core::dtype::DType;
-use yule_core::error::{Result, YuleError};
+use yule_core::error::Result;
 use yule_core::model::Architecture;
 use yule_core::tensor::TensorInfo;
 
@@ -54,13 +54,7 @@ fn qmv(weight_info: &TensorInfo, weight_data: &[u8], input: &[f32], out: &mut [f
     Ok(())
 }
 
-fn rms_norm(
-    x: &[f32],
-    weight_data: &[u8],
-    weight_info: &TensorInfo,
-    eps: f32,
-    out: &mut [f32],
-) {
+fn rms_norm(x: &[f32], weight_data: &[u8], weight_info: &TensorInfo, eps: f32, out: &mut [f32]) {
     let n = x.len();
     let mut ss = 0.0f32;
     for &v in x {
@@ -87,10 +81,10 @@ fn rms_norm(
 struct MambaConfig {
     dim: usize,
     n_layers: usize,
-    d_inner: usize,    // typically 2 * dim
-    d_state: usize,    // SSM state dimension (typically 16)
-    d_conv: usize,     // conv1d kernel size (typically 4)
-    dt_rank: usize,    // rank of dt projection (typically dim / 16)
+    d_inner: usize, // typically 2 * dim
+    d_state: usize, // SSM state dimension (typically 16)
+    d_conv: usize,  // conv1d kernel size (typically 4)
+    dt_rank: usize, // rank of dt projection (typically dim / 16)
     vocab_size: usize,
     norm_eps: f32,
 }
@@ -143,8 +137,7 @@ impl<'a> MambaWeights<'a> {
         self.store.require(&format!("blk.{layer}.attn_norm.weight"))
     }
     fn in_proj(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store
-            .require(&format!("blk.{layer}.ssm_in.weight"))
+        self.store.require(&format!("blk.{layer}.ssm_in.weight"))
     }
     fn conv1d_weight(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
         self.store
@@ -154,26 +147,22 @@ impl<'a> MambaWeights<'a> {
         self.store.get(&format!("blk.{layer}.ssm_conv1d.bias"))
     }
     fn dt_proj_weight(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store
-            .require(&format!("blk.{layer}.ssm_dt.weight"))
+        self.store.require(&format!("blk.{layer}.ssm_dt.weight"))
     }
     fn dt_proj_bias(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
         self.store.get(&format!("blk.{layer}.ssm_dt.bias"))
     }
     fn a_log(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store
-            .require(&format!("blk.{layer}.ssm_a"))
+        self.store.require(&format!("blk.{layer}.ssm_a"))
     }
     fn d(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
         self.store.get(&format!("blk.{layer}.ssm_d"))
     }
     fn out_proj(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store
-            .require(&format!("blk.{layer}.ssm_out.weight"))
+        self.store.require(&format!("blk.{layer}.ssm_out.weight"))
     }
     fn x_proj(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store
-            .require(&format!("blk.{layer}.ssm_x.weight"))
+        self.store.require(&format!("blk.{layer}.ssm_x.weight"))
     }
 }
 
@@ -187,7 +176,7 @@ impl<'a> MambaRunner<'a> {
         let d_inner = 2 * dim;
         let d_state = 16;
         let d_conv = 4;
-        let dt_rank = (dim + 15) / 16; // ceil(dim/16)
+        let dt_rank = dim.div_ceil(16);
         let vocab_size = meta.vocab_size as usize;
 
         let cfg = MambaConfig {
@@ -310,10 +299,8 @@ impl<'a> MambaRunner<'a> {
                             conv_data[w_idx * 4 + 3],
                         ])
                     } else {
-                        let bits = u16::from_le_bytes([
-                            conv_data[w_idx * 2],
-                            conv_data[w_idx * 2 + 1],
-                        ]);
+                        let bits =
+                            u16::from_le_bytes([conv_data[w_idx * 2], conv_data[w_idx * 2 + 1]]);
                         dequant::f16_to_f32(bits)
                     };
                     sum += state.conv_state[i * d_conv + k] * w;
@@ -409,8 +396,7 @@ impl<'a> MambaRunner<'a> {
                             a_data[a_idx * 4 + 3],
                         ])
                     } else {
-                        let bits =
-                            u16::from_le_bytes([a_data[a_idx * 2], a_data[a_idx * 2 + 1]]);
+                        let bits = u16::from_le_bytes([a_data[a_idx * 2], a_data[a_idx * 2 + 1]]);
                         dequant::f16_to_f32(bits)
                     };
                     // A is stored as -exp(a_log), so A = -exp(a_val)
@@ -452,7 +438,12 @@ impl<'a> MambaRunner<'a> {
 
             // Output projection
             let (out_info, out_data) = self.weights.out_proj(layer as u32)?;
-            qmv(out_info, out_data, &self.scratch.y, &mut self.scratch.out_proj)?;
+            qmv(
+                out_info,
+                out_data,
+                &self.scratch.y,
+                &mut self.scratch.out_proj,
+            )?;
 
             // Residual
             for i in 0..dim {
@@ -510,8 +501,6 @@ impl<'a> ModelRunner for MambaRunner<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_softplus() {
         let x = 1.0f32;
@@ -520,7 +509,7 @@ mod tests {
 
         // softplus(0) = ln(2)
         let sp0 = (1.0 + 0.0f32.exp()).ln();
-        assert!((sp0 - 0.6931).abs() < 1e-3);
+        assert!((sp0 - std::f32::consts::LN_2).abs() < 1e-3);
     }
 
     #[test]

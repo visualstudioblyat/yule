@@ -586,7 +586,12 @@ impl<'a> TransformerRunner<'a> {
 
                 // Router: matmul hidden state with gating weights → [n_experts]
                 let (ri, rd) = self.weights.ffn_gate_inp(layer as u32)?;
-                qmv(ri, rd, &self.scratch.normed, &mut self.scratch.router_logits[..n_exp])?;
+                qmv(
+                    ri,
+                    rd,
+                    &self.scratch.normed,
+                    &mut self.scratch.router_logits[..n_exp],
+                )?;
 
                 // Softmax over router logits
                 let router = &mut self.scratch.router_logits[..n_exp];
@@ -629,12 +634,12 @@ impl<'a> TransformerRunner<'a> {
                     let l = layer as u32;
 
                     if let Some((gi, gd)) = self.weights.ffn_gate_expert(l, e) {
-                        let (ui, ud) = self.weights.ffn_up_expert(l, e)
-                            .ok_or_else(|| YuleError::Inference(
-                                format!("missing ffn_up expert {e} layer {l}")))?;
-                        let (di, dd) = self.weights.ffn_down_expert(l, e)
-                            .ok_or_else(|| YuleError::Inference(
-                                format!("missing ffn_down expert {e} layer {l}")))?;
+                        let (ui, ud) = self.weights.ffn_up_expert(l, e).ok_or_else(|| {
+                            YuleError::Inference(format!("missing ffn_up expert {e} layer {l}"))
+                        })?;
+                        let (di, dd) = self.weights.ffn_down_expert(l, e).ok_or_else(|| {
+                            YuleError::Inference(format!("missing ffn_down expert {e} layer {l}"))
+                        })?;
 
                         qmv(gi, gd, &self.scratch.normed, &mut self.scratch.gate[..ff])?;
                         qmv(ui, ud, &self.scratch.normed, &mut self.scratch.up[..ff])?;
@@ -646,15 +651,20 @@ impl<'a> TransformerRunner<'a> {
                                 self.scratch.gate[i] * sigmoid * self.scratch.up[i];
                         }
 
-                        qmv(di, dd, &self.scratch.gate[..ff], &mut self.scratch.expert_out)?;
+                        qmv(
+                            di,
+                            dd,
+                            &self.scratch.gate[..ff],
+                            &mut self.scratch.expert_out,
+                        )?;
                     } else if let Some((gi, gd)) = self.weights.ffn_gate_exps(l) {
                         // Packed expert tensors: slice out this expert's rows
-                        let (ui, ud) = self.weights.ffn_up_exps(l)
-                            .ok_or_else(|| YuleError::Inference(
-                                format!("missing ffn_up_exps layer {l}")))?;
-                        let (di, dd) = self.weights.ffn_down_exps(l)
-                            .ok_or_else(|| YuleError::Inference(
-                                format!("missing ffn_down_exps layer {l}")))?;
+                        let (ui, ud) = self.weights.ffn_up_exps(l).ok_or_else(|| {
+                            YuleError::Inference(format!("missing ffn_up_exps layer {l}"))
+                        })?;
+                        let (di, dd) = self.weights.ffn_down_exps(l).ok_or_else(|| {
+                            YuleError::Inference(format!("missing ffn_down_exps layer {l}"))
+                        })?;
 
                         // For packed tensors, each expert has ff_dim rows.
                         // Row data size = total_bytes / (n_experts * ff_dim) * ff_dim
@@ -679,10 +689,18 @@ impl<'a> TransformerRunner<'a> {
                         de_info.shape = vec![ff as u64, dim as u64];
                         de_info.size_bytes = down_expert_bytes as u64;
 
-                        qmv(&ge_info, &gd[gate_off..gate_off + gate_expert_bytes],
-                            &self.scratch.normed, &mut self.scratch.gate[..ff])?;
-                        qmv(&ue_info, &ud[up_off..up_off + up_expert_bytes],
-                            &self.scratch.normed, &mut self.scratch.up[..ff])?;
+                        qmv(
+                            &ge_info,
+                            &gd[gate_off..gate_off + gate_expert_bytes],
+                            &self.scratch.normed,
+                            &mut self.scratch.gate[..ff],
+                        )?;
+                        qmv(
+                            &ue_info,
+                            &ud[up_off..up_off + up_expert_bytes],
+                            &self.scratch.normed,
+                            &mut self.scratch.up[..ff],
+                        )?;
 
                         for i in 0..ff {
                             let sigmoid = 1.0 / (1.0 + (-self.scratch.gate[i]).exp());
@@ -690,8 +708,12 @@ impl<'a> TransformerRunner<'a> {
                                 self.scratch.gate[i] * sigmoid * self.scratch.up[i];
                         }
 
-                        qmv(&de_info, &dd[down_off..down_off + down_expert_bytes],
-                            &self.scratch.gate[..ff], &mut self.scratch.expert_out)?;
+                        qmv(
+                            &de_info,
+                            &dd[down_off..down_off + down_expert_bytes],
+                            &self.scratch.gate[..ff],
+                            &mut self.scratch.expert_out,
+                        )?;
                     } else {
                         return Err(YuleError::Inference(format!(
                             "no expert weights found for layer {l} expert {e}"
@@ -851,12 +873,15 @@ mod tests {
     #[test]
     fn test_moe_router_topk_selection() {
         // Simulate router logits for 8 experts
-        let mut router_logits = vec![0.1, 0.05, 0.8, 0.02, 0.5, 0.03, 0.01, 0.3];
+        let mut router_logits = [0.1f32, 0.05, 0.8, 0.02, 0.5, 0.03, 0.01, 0.3];
         let n_exp = router_logits.len();
         let n_used = 2;
 
         // Softmax
-        let max_r = router_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_r = router_logits
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
         let mut sum_r = 0.0f32;
         for r in router_logits.iter_mut() {
             *r = (*r - max_r).exp();
