@@ -15,6 +15,7 @@ pub struct VulkanDevice {
     pub subgroup_size: u32,
     pub max_workgroup_size: u32,
     pub max_shared_memory: u32,
+    pub has_cooperative_matrix: bool,
 }
 
 impl VulkanDevice {
@@ -70,15 +71,38 @@ impl VulkanDevice {
             .ok_or_else(|| YuleError::Gpu("no compute queue family found".into()))?
             as u32;
 
-        // Create logical device
+        // Check for VK_KHR_cooperative_matrix extension
+        let available_extensions = unsafe {
+            instance
+                .enumerate_device_extension_properties(physical_device)
+                .unwrap_or_default()
+        };
+        let has_cooperative_matrix = available_extensions.iter().any(|ext| {
+            let name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+            name.to_bytes() == b"VK_KHR_cooperative_matrix"
+        });
+
+        if has_cooperative_matrix {
+            tracing::info!("  VK_KHR_cooperative_matrix: supported");
+        }
+
+        // Create logical device (enable cooperative_matrix if available)
         let queue_priorities = [1.0f32];
         let queue_create_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&queue_priorities);
 
+        let coop_ext_name = c"VK_KHR_cooperative_matrix";
+        let enabled_extensions: Vec<*const i8> = if has_cooperative_matrix {
+            vec![coop_ext_name.as_ptr()]
+        } else {
+            vec![]
+        };
+
         let queue_create_infos = [queue_create_info];
-        let device_create_info =
-            vk::DeviceCreateInfo::default().queue_create_infos(&queue_create_infos);
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_create_infos)
+            .enabled_extension_names(&enabled_extensions);
 
         let device = unsafe {
             instance
@@ -118,6 +142,7 @@ impl VulkanDevice {
             subgroup_size,
             max_workgroup_size,
             max_shared_memory,
+            has_cooperative_matrix,
         })
     }
 

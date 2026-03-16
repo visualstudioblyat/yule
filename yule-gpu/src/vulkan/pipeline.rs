@@ -17,6 +17,10 @@ pub enum ShaderKey {
     QmvQ4K,
     QmvQ6K,
     QmvQ8_0,
+    // Cooperative matrix variants (VK_KHR_cooperative_matrix)
+    CoopMatmul,
+    CoopQmvQ4_0,
+    CoopQmvQ4K,
 }
 
 pub struct ComputePipeline {

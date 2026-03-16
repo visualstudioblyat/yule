@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod cooperative_matrix;
 pub mod device;
 pub mod memory;
 pub mod pipeline;
@@ -253,7 +254,7 @@ impl ComputeBackend for VulkanBackend {
         };
 
         let block_size = dtype.block_size() as u32;
-        let blocks_per_row = (n_cols + block_size - 1) / block_size;
+        let blocks_per_row = n_cols.div_ceil(block_size);
         let push = [n_rows, n_cols, blocks_per_row];
         let push_bytes = bytemuck::cast_slice(&push);
 
@@ -300,7 +301,7 @@ impl ComputeBackend for VulkanBackend {
         let push_bytes = bytemuck::cast_slice(&push);
         let half_dim = head_dim / 2;
         let total_threads = n_heads_q * half_dim + n_heads_k * half_dim;
-        let wg_x = (total_threads + 63) / 64;
+        let wg_x = total_threads.div_ceil(64);
         self.dispatch(ShaderKey::Rope, &[q, k, q, k], push_bytes, wg_x, 1, 1)
     }
 
@@ -311,7 +312,7 @@ impl ComputeBackend for VulkanBackend {
             ShaderKey::SiluMul,
             &[input, output, output],
             push_bytes,
-            (size + 255) / 256,
+            size.div_ceil(256),
             1,
             1,
         )
@@ -331,7 +332,7 @@ impl ComputeBackend for VulkanBackend {
             ShaderKey::SiluMul,
             &[a, b, output],
             push_bytes,
-            (size + 255) / 256,
+            size.div_ceil(256),
             1,
             1,
         )
@@ -350,7 +351,7 @@ impl ComputeBackend for VulkanBackend {
             ShaderKey::Add,
             &[a, b, output],
             push_bytes,
-            (size + 255) / 256,
+            size.div_ceil(256),
             1,
             1,
         )
