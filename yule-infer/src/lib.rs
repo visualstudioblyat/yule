@@ -131,12 +131,21 @@ impl InferenceEngine {
 
         runner.reset();
 
-        // Prefill input tokens
+        // Validate input
         if request.tokens.is_empty() {
             return Err(yule_core::error::YuleError::Inference(
                 "empty input tokens".into(),
             ));
         }
+        let total_len = request.tokens.len() as u32 + request.max_new_tokens;
+        if total_len > self.config.max_context_len {
+            return Err(yule_core::error::YuleError::Inference(format!(
+                "requested {} tokens exceeds max context length {}",
+                total_len, self.config.max_context_len
+            )));
+        }
+
+        // Prefill input tokens
         let mut logits = runner.prefill(&request.tokens)?;
 
         // Create sampler
