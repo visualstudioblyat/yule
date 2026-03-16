@@ -122,11 +122,7 @@ impl PagedKvCache {
         }
     }
 
-    pub fn allocate_page(
-        &mut self,
-        backend: &dyn ComputeBackend,
-        layer: u32,
-    ) -> Result<u32> {
+    pub fn allocate_page(&mut self, backend: &dyn ComputeBackend, layer: u32) -> Result<u32> {
         let page_elements =
             self.page_size as usize * self.num_kv_heads as usize * self.head_dim as usize;
         let buf_size = page_elements * 4 * 2; // K + V interleaved

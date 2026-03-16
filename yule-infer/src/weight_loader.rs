@@ -84,11 +84,9 @@ fn translate_hf_name(hf_name: &str) -> String {
     // Global tensors
     match hf_name {
         "model.embed_tokens.weight" | "transformer.wte.weight" => {
-            return "token_embd.weight".to_string()
+            return "token_embd.weight".to_string();
         }
-        "model.norm.weight" | "transformer.ln_f.weight" => {
-            return "output_norm.weight".to_string()
-        }
+        "model.norm.weight" | "transformer.ln_f.weight" => return "output_norm.weight".to_string(),
         "lm_head.weight" => return "output.weight".to_string(),
         _ => {}
     }
