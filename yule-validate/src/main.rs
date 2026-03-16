@@ -56,7 +56,7 @@ fn main() {
     }
 
     // Load model + runner only if needed
-    let needs_model = (1..=31).any(|id| should_run(id));
+    let needs_model = (1..=31).any(&should_run);
     if needs_model {
         println!("Loading model from: {}", model_path.display());
 
