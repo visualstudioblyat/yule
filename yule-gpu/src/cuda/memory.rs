@@ -127,4 +127,28 @@ impl CudaMemoryManager {
         }
         Ok(())
     }
+
+    /// Get the device pointer (as u64) for a buffer handle.
+    pub fn device_ptr(&self, handle: &BufferHandle) -> Result<u64> {
+        let buffers = self.buffers.lock().unwrap();
+        let buf = buffers.get(&handle.0).ok_or_else(|| {
+            YuleError::Gpu(format!("cuda device_ptr: unknown buffer {}", handle.0))
+        })?;
+        Ok(*buf.device_ptr() as u64)
+    }
+
+    /// Lock the buffer map and return device pointers for multiple handles at once.
+    /// This avoids repeated lock acquisitions during kernel dispatch.
+    pub fn device_ptrs(&self, handles: &[&BufferHandle]) -> Result<Vec<u64>> {
+        let buffers = self.buffers.lock().unwrap();
+        handles
+            .iter()
+            .map(|h| {
+                let buf = buffers.get(&h.0).ok_or_else(|| {
+                    YuleError::Gpu(format!("cuda device_ptrs: unknown buffer {}", h.0))
+                })?;
+                Ok(*buf.device_ptr() as u64)
+            })
+            .collect()
+    }
 }
