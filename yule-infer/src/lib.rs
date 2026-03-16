@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod batch;
 #[cfg(feature = "vulkan")]
 pub mod gpu_runner;
 pub mod kv_cache;
