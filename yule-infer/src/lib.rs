@@ -2,6 +2,7 @@ pub mod attention;
 #[cfg(feature = "vulkan")]
 pub mod gpu_runner;
 pub mod kv_cache;
+pub mod mamba;
 pub mod model_runner;
 pub mod sampler;
 pub mod speculative;

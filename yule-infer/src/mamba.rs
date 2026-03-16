@@ -1,0 +1,549 @@
+//! Mamba (Selective State Space Model) runner.
+//!
+//! Mamba replaces attention with a selective state-space mechanism:
+//! - Linear time complexity O(L) vs O(L²) for transformers
+//! - Constant memory per token (state instead of KV cache)
+//! - 5x throughput vs transformers on long sequences
+//!
+//! Architecture per layer:
+//! 1. Norm → linear projection (input → 2*d_inner)
+//! 2. Split into x and z branches
+//! 3. x: Conv1D(d_inner, kernel_size) → SiLU → SSM
+//! 4. z: SiLU gate
+//! 5. output = (SSM(x) * SiLU(z)) → output projection
+//!
+//! The SSM (Structured State Space) operation:
+//!   h[t] = A_bar * h[t-1] + B_bar * x[t]
+//!   y[t] = C * h[t] + D * x[t]
+//! where A_bar, B_bar are discretized from continuous parameters via ZOH.
+
+#![allow(clippy::needless_range_loop)]
+
+use crate::model_runner::ModelRunner;
+use crate::weight_loader::WeightStore;
+use yule_core::dequant;
+use yule_core::dtype::DType;
+use yule_core::error::{Result, YuleError};
+use yule_core::model::Architecture;
+use yule_core::tensor::TensorInfo;
+
+fn qmv(weight_info: &TensorInfo, weight_data: &[u8], input: &[f32], out: &mut [f32]) -> Result<()> {
+    let dtype = weight_info.dtype;
+    let block_size = dtype.block_size();
+    let block_bytes = dtype.size_of_block();
+    let n_rows = out.len();
+    let n_cols = input.len();
+    let blocks_per_row = n_cols / block_size;
+
+    for row in 0..n_rows {
+        let mut sum = 0.0f32;
+        let row_offset = row * blocks_per_row * block_bytes;
+        for b in 0..blocks_per_row {
+            let block_start = row_offset + b * block_bytes;
+            let block = &weight_data[block_start..block_start + block_bytes];
+            let act_start = b * block_size;
+            let act = &input[act_start..act_start + block_size];
+            sum += dequant::vec_dot_block(dtype, block, act).unwrap_or_else(|_| {
+                let mut tmp = vec![0.0f32; block_size];
+                let _ = dequant::dequant_block(dtype, block, &mut tmp);
+                tmp.iter().zip(act.iter()).map(|(w, a)| w * a).sum::<f32>()
+            });
+        }
+        out[row] = sum;
+    }
+    Ok(())
+}
+
+fn rms_norm(
+    x: &[f32],
+    weight_data: &[u8],
+    weight_info: &TensorInfo,
+    eps: f32,
+    out: &mut [f32],
+) {
+    let n = x.len();
+    let mut ss = 0.0f32;
+    for &v in x {
+        ss += v * v;
+    }
+    let inv = 1.0 / (ss / n as f32 + eps).sqrt();
+
+    for i in 0..n {
+        let w = if weight_info.dtype == DType::F32 {
+            f32::from_le_bytes([
+                weight_data[i * 4],
+                weight_data[i * 4 + 1],
+                weight_data[i * 4 + 2],
+                weight_data[i * 4 + 3],
+            ])
+        } else {
+            let bits = u16::from_le_bytes([weight_data[i * 2], weight_data[i * 2 + 1]]);
+            dequant::f16_to_f32(bits)
+        };
+        out[i] = x[i] * inv * w;
+    }
+}
+
+struct MambaConfig {
+    dim: usize,
+    n_layers: usize,
+    d_inner: usize,    // typically 2 * dim
+    d_state: usize,    // SSM state dimension (typically 16)
+    d_conv: usize,     // conv1d kernel size (typically 4)
+    dt_rank: usize,    // rank of dt projection (typically dim / 16)
+    vocab_size: usize,
+    norm_eps: f32,
+}
+
+struct MambaLayerState {
+    conv_state: Vec<f32>, // [d_inner, d_conv] — ring buffer for conv1d
+    ssm_state: Vec<f32>,  // [d_inner, d_state] — recurrent state
+}
+
+struct MambaScratch {
+    normed: Vec<f32>,
+    xz: Vec<f32>,       // [2 * d_inner] — combined x and z from in_proj
+    x: Vec<f32>,        // [d_inner]
+    z: Vec<f32>,        // [d_inner]
+    x_conv: Vec<f32>,   // [d_inner] — after conv1d
+    dt: Vec<f32>,       // [d_inner] — discretization timestep
+    dt_proj: Vec<f32>,  // [dt_rank]
+    b: Vec<f32>,        // [d_state]
+    c: Vec<f32>,        // [d_state]
+    y: Vec<f32>,        // [d_inner] — SSM output
+    out_proj: Vec<f32>, // [dim]
+    logits: Vec<f32>,
+}
+
+pub struct MambaRunner<'a> {
+    cfg: MambaConfig,
+    weights: MambaWeights<'a>,
+    layer_states: Vec<MambaLayerState>,
+    hidden: Vec<f32>,
+    scratch: MambaScratch,
+}
+
+struct MambaWeights<'a> {
+    store: &'a WeightStore<'a>,
+}
+
+impl<'a> MambaWeights<'a> {
+    fn token_embd(&self) -> Result<(&TensorInfo, &[u8])> {
+        self.store.require("token_embd.weight")
+    }
+    fn output_norm(&self) -> Result<(&TensorInfo, &[u8])> {
+        self.store.require("output_norm.weight")
+    }
+    fn output(&self) -> Result<(&TensorInfo, &[u8])> {
+        self.store
+            .require("output.weight")
+            .or_else(|_| self.store.require("token_embd.weight"))
+    }
+    fn layer_norm(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
+        self.store.require(&format!("blk.{layer}.attn_norm.weight"))
+    }
+    fn in_proj(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
+        self.store
+            .require(&format!("blk.{layer}.ssm_in.weight"))
+    }
+    fn conv1d_weight(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
+        self.store
+            .require(&format!("blk.{layer}.ssm_conv1d.weight"))
+    }
+    fn conv1d_bias(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
+        self.store.get(&format!("blk.{layer}.ssm_conv1d.bias"))
+    }
+    fn dt_proj_weight(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
+        self.store
+            .require(&format!("blk.{layer}.ssm_dt.weight"))
+    }
+    fn dt_proj_bias(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
+        self.store.get(&format!("blk.{layer}.ssm_dt.bias"))
+    }
+    fn a_log(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
+        self.store
+            .require(&format!("blk.{layer}.ssm_a"))
+    }
+    fn d(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
+        self.store.get(&format!("blk.{layer}.ssm_d"))
+    }
+    fn out_proj(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
+        self.store
+            .require(&format!("blk.{layer}.ssm_out.weight"))
+    }
+    fn x_proj(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
+        self.store
+            .require(&format!("blk.{layer}.ssm_x.weight"))
+    }
+}
+
+impl<'a> MambaRunner<'a> {
+    pub fn new(store: &'a WeightStore<'a>) -> Result<Self> {
+        let meta = &store.meta;
+        let dim = meta.embedding_dim as usize;
+        let n_layers = meta.layer_count as usize;
+
+        // Mamba defaults — infer from tensor shapes if possible
+        let d_inner = 2 * dim;
+        let d_state = 16;
+        let d_conv = 4;
+        let dt_rank = (dim + 15) / 16; // ceil(dim/16)
+        let vocab_size = meta.vocab_size as usize;
+
+        let cfg = MambaConfig {
+            dim,
+            n_layers,
+            d_inner,
+            d_state,
+            d_conv,
+            dt_rank,
+            vocab_size,
+            norm_eps: meta.norm_eps.unwrap_or(1e-5),
+        };
+
+        let mut layer_states = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            layer_states.push(MambaLayerState {
+                conv_state: vec![0.0; d_inner * d_conv],
+                ssm_state: vec![0.0; d_inner * d_state],
+            });
+        }
+
+        let scratch = MambaScratch {
+            normed: vec![0.0; dim],
+            xz: vec![0.0; 2 * d_inner],
+            x: vec![0.0; d_inner],
+            z: vec![0.0; d_inner],
+            x_conv: vec![0.0; d_inner],
+            dt: vec![0.0; d_inner],
+            dt_proj: vec![0.0; dt_rank],
+            b: vec![0.0; d_state],
+            c: vec![0.0; d_state],
+            y: vec![0.0; d_inner],
+            out_proj: vec![0.0; dim],
+            logits: vec![0.0; vocab_size],
+        };
+
+        Ok(Self {
+            cfg,
+            weights: MambaWeights { store },
+            layer_states,
+            hidden: vec![0.0; dim],
+            scratch,
+        })
+    }
+
+    fn forward(&mut self, token: u32) -> Result<Vec<f32>> {
+        let dim = self.cfg.dim;
+        let d_inner = self.cfg.d_inner;
+        let d_state = self.cfg.d_state;
+        let d_conv = self.cfg.d_conv;
+
+        // 1. Token embedding
+        let (embd_info, embd_data) = self.weights.token_embd()?;
+        let embd_dtype = embd_info.dtype;
+        let embd_row_bytes = embd_info.size_bytes as usize / self.cfg.vocab_size;
+        let tok_offset = token as usize * embd_row_bytes;
+        let tok_data = &embd_data[tok_offset..tok_offset + embd_row_bytes];
+
+        if embd_dtype == DType::F32 {
+            for i in 0..dim {
+                self.hidden[i] = f32::from_le_bytes([
+                    tok_data[i * 4],
+                    tok_data[i * 4 + 1],
+                    tok_data[i * 4 + 2],
+                    tok_data[i * 4 + 3],
+                ]);
+            }
+        } else {
+            let bs = embd_dtype.block_size();
+            let bb = embd_dtype.size_of_block();
+            for b in 0..(dim / bs) {
+                let block = &tok_data[b * bb..(b + 1) * bb];
+                dequant::dequant_block(embd_dtype, block, &mut self.hidden[b * bs..(b + 1) * bs])?;
+            }
+        }
+
+        // 2. Mamba layers
+        for layer in 0..self.cfg.n_layers {
+            let residual: Vec<f32> = self.hidden.clone();
+
+            // Layer norm
+            let (norm_info, norm_data) = self.weights.layer_norm(layer as u32)?;
+            rms_norm(
+                &self.hidden,
+                norm_data,
+                norm_info,
+                self.cfg.norm_eps,
+                &mut self.scratch.normed,
+            );
+
+            // In projection: normed → [x, z] (2 * d_inner)
+            let (in_info, in_data) = self.weights.in_proj(layer as u32)?;
+            qmv(in_info, in_data, &self.scratch.normed, &mut self.scratch.xz)?;
+
+            // Split into x and z
+            self.scratch.x[..d_inner].copy_from_slice(&self.scratch.xz[..d_inner]);
+            self.scratch.z[..d_inner].copy_from_slice(&self.scratch.xz[d_inner..2 * d_inner]);
+
+            // Conv1D: shift conv state and apply
+            let state = &mut self.layer_states[layer];
+            // Shift conv state: move columns left, insert x as rightmost column
+            for i in 0..d_inner {
+                for k in 0..d_conv - 1 {
+                    state.conv_state[i * d_conv + k] = state.conv_state[i * d_conv + k + 1];
+                }
+                state.conv_state[i * d_conv + d_conv - 1] = self.scratch.x[i];
+            }
+
+            // Conv1D output: for each d_inner channel, dot product with conv kernel
+            let (conv_info, conv_data) = self.weights.conv1d_weight(layer as u32)?;
+            for i in 0..d_inner {
+                let mut sum = 0.0f32;
+                for k in 0..d_conv {
+                    let w_idx = i * d_conv + k;
+                    let w = if conv_info.dtype == DType::F32 {
+                        f32::from_le_bytes([
+                            conv_data[w_idx * 4],
+                            conv_data[w_idx * 4 + 1],
+                            conv_data[w_idx * 4 + 2],
+                            conv_data[w_idx * 4 + 3],
+                        ])
+                    } else {
+                        let bits = u16::from_le_bytes([
+                            conv_data[w_idx * 2],
+                            conv_data[w_idx * 2 + 1],
+                        ]);
+                        dequant::f16_to_f32(bits)
+                    };
+                    sum += state.conv_state[i * d_conv + k] * w;
+                }
+                self.scratch.x_conv[i] = sum;
+            }
+
+            // Add conv bias if present
+            if let Some((bias_info, bias_data)) = self.weights.conv1d_bias(layer as u32) {
+                for i in 0..d_inner {
+                    let b = if bias_info.dtype == DType::F32 {
+                        f32::from_le_bytes([
+                            bias_data[i * 4],
+                            bias_data[i * 4 + 1],
+                            bias_data[i * 4 + 2],
+                            bias_data[i * 4 + 3],
+                        ])
+                    } else {
+                        let bits = u16::from_le_bytes([bias_data[i * 2], bias_data[i * 2 + 1]]);
+                        dequant::f16_to_f32(bits)
+                    };
+                    self.scratch.x_conv[i] += b;
+                }
+            }
+
+            // SiLU on x_conv
+            for i in 0..d_inner {
+                let x = self.scratch.x_conv[i];
+                self.scratch.x_conv[i] = x / (1.0 + (-x).exp());
+            }
+
+            // SSM: x_proj → [dt_proj_input, B, C]
+            let (xp_info, xp_data) = self.weights.x_proj(layer as u32)?;
+            let x_proj_dim = self.cfg.dt_rank + 2 * d_state;
+            let mut x_proj_out = vec![0.0f32; x_proj_dim];
+            qmv(xp_info, xp_data, &self.scratch.x_conv, &mut x_proj_out)?;
+
+            // Split x_proj output
+            self.scratch.dt_proj[..self.cfg.dt_rank]
+                .copy_from_slice(&x_proj_out[..self.cfg.dt_rank]);
+            self.scratch.b[..d_state]
+                .copy_from_slice(&x_proj_out[self.cfg.dt_rank..self.cfg.dt_rank + d_state]);
+            self.scratch.c[..d_state].copy_from_slice(
+                &x_proj_out[self.cfg.dt_rank + d_state..self.cfg.dt_rank + 2 * d_state],
+            );
+
+            // dt = softplus(dt_proj_weight @ dt_proj_input + dt_proj_bias)
+            let (dt_info, dt_data) = self.weights.dt_proj_weight(layer as u32)?;
+            qmv(
+                dt_info,
+                dt_data,
+                &self.scratch.dt_proj[..self.cfg.dt_rank],
+                &mut self.scratch.dt,
+            )?;
+            if let Some((bias_info, bias_data)) = self.weights.dt_proj_bias(layer as u32) {
+                for i in 0..d_inner {
+                    let b = if bias_info.dtype == DType::F32 {
+                        f32::from_le_bytes([
+                            bias_data[i * 4],
+                            bias_data[i * 4 + 1],
+                            bias_data[i * 4 + 2],
+                            bias_data[i * 4 + 3],
+                        ])
+                    } else {
+                        let bits = u16::from_le_bytes([bias_data[i * 2], bias_data[i * 2 + 1]]);
+                        dequant::f16_to_f32(bits)
+                    };
+                    self.scratch.dt[i] += b;
+                }
+            }
+            // Softplus: log(1 + exp(x))
+            for i in 0..d_inner {
+                self.scratch.dt[i] = (1.0 + self.scratch.dt[i].exp()).ln();
+            }
+
+            // Load A (stored as log, negate)
+            let (a_info, a_data) = self.weights.a_log(layer as u32)?;
+
+            // SSM step: h = A_bar * h + B_bar * x, y = C * h + D * x
+            // A_bar = exp(dt * A), B_bar = dt * B
+            for i in 0..d_inner {
+                let dt_i = self.scratch.dt[i];
+                let x_i = self.scratch.x_conv[i];
+
+                let mut y_i = 0.0f32;
+                for j in 0..d_state {
+                    let a_idx = i * d_state + j;
+                    let a_val = if a_info.dtype == DType::F32 {
+                        f32::from_le_bytes([
+                            a_data[a_idx * 4],
+                            a_data[a_idx * 4 + 1],
+                            a_data[a_idx * 4 + 2],
+                            a_data[a_idx * 4 + 3],
+                        ])
+                    } else {
+                        let bits =
+                            u16::from_le_bytes([a_data[a_idx * 2], a_data[a_idx * 2 + 1]]);
+                        dequant::f16_to_f32(bits)
+                    };
+                    // A is stored as -exp(a_log), so A = -exp(a_val)
+                    let a = -(a_val.exp());
+                    let a_bar = (dt_i * a).exp();
+                    let b_bar = dt_i * self.scratch.b[j];
+
+                    // Update state
+                    let h = &mut state.ssm_state[i * d_state + j];
+                    *h = a_bar * *h + b_bar * x_i;
+                    y_i += self.scratch.c[j] * *h;
+                }
+
+                // D * x (skip connection)
+                if let Some((d_info, d_data)) = self.weights.d(layer as u32) {
+                    let d_val = if d_info.dtype == DType::F32 {
+                        f32::from_le_bytes([
+                            d_data[i * 4],
+                            d_data[i * 4 + 1],
+                            d_data[i * 4 + 2],
+                            d_data[i * 4 + 3],
+                        ])
+                    } else {
+                        let bits = u16::from_le_bytes([d_data[i * 2], d_data[i * 2 + 1]]);
+                        dequant::f16_to_f32(bits)
+                    };
+                    y_i += d_val * x_i;
+                }
+
+                self.scratch.y[i] = y_i;
+            }
+
+            // Gate: y = y * SiLU(z)
+            for i in 0..d_inner {
+                let z = self.scratch.z[i];
+                let silu_z = z / (1.0 + (-z).exp());
+                self.scratch.y[i] *= silu_z;
+            }
+
+            // Output projection
+            let (out_info, out_data) = self.weights.out_proj(layer as u32)?;
+            qmv(out_info, out_data, &self.scratch.y, &mut self.scratch.out_proj)?;
+
+            // Residual
+            for i in 0..dim {
+                self.hidden[i] = residual[i] + self.scratch.out_proj[i];
+            }
+        }
+
+        // 3. Final norm
+        let (on_info, on_data) = self.weights.output_norm()?;
+        rms_norm(
+            &self.hidden,
+            on_data,
+            on_info,
+            self.cfg.norm_eps,
+            &mut self.scratch.normed,
+        );
+
+        // 4. Output logits
+        let (out_info, out_data) = self.weights.output()?;
+        qmv(
+            out_info,
+            out_data,
+            &self.scratch.normed,
+            &mut self.scratch.logits,
+        )?;
+
+        Ok(self.scratch.logits.clone())
+    }
+}
+
+impl<'a> ModelRunner for MambaRunner<'a> {
+    fn architecture(&self) -> Architecture {
+        Architecture::Mamba
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let mut logits = Vec::new();
+        for &tok in tokens {
+            logits = self.forward(tok)?;
+        }
+        Ok(logits)
+    }
+
+    fn decode_step(&mut self, token: u32) -> Result<Vec<f32>> {
+        self.forward(token)
+    }
+
+    fn reset(&mut self) {
+        for state in &mut self.layer_states {
+            state.conv_state.fill(0.0);
+            state.ssm_state.fill(0.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_softplus() {
+        let x = 1.0f32;
+        let sp = (1.0 + x.exp()).ln();
+        assert!((sp - 1.3133).abs() < 1e-3);
+
+        // softplus(0) = ln(2)
+        let sp0 = (1.0 + 0.0f32.exp()).ln();
+        assert!((sp0 - 0.6931).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_ssm_step_zero_state() {
+        // With zero initial state and identity-like parameters,
+        // the SSM should pass through the input scaled by B*dt*C
+        let d_state = 2;
+        let mut h = vec![0.0f32; d_state];
+        let x = 1.0f32;
+        let dt = 0.1f32;
+        let a = -1.0f32; // negative (stable)
+        let b = vec![1.0f32; d_state];
+        let c = vec![1.0f32; d_state];
+
+        let mut y = 0.0f32;
+        for j in 0..d_state {
+            let a_bar = (dt * a).exp();
+            let b_bar = dt * b[j];
+            h[j] = a_bar * h[j] + b_bar * x;
+            y += c[j] * h[j];
+        }
+
+        // y should be approximately dt * x * d_state = 0.1 * 1.0 * 2 = 0.2
+        assert!((y - 0.2).abs() < 1e-4, "y = {y}");
+    }
+}
