@@ -15,6 +15,8 @@ pub fn vec_dot_dispatch(dtype: DType, block: &[u8], act: &[f32]) -> Option<f32> 
         DType::Q5_K => Some(dequant::vec_dot_q5_k(block, act)),
         DType::Q6_K => Some(dequant::vec_dot_q6_k(block, act)),
         DType::IQ4_NL => Some(dequant::vec_dot_iq4_nl(block, act)),
+        DType::TQ1_0 => Some(dequant::vec_dot_tq1_0(block, act)),
+        DType::TQ2_0 => Some(dequant::vec_dot_tq2_0(block, act)),
         _ => None,
     }
 }

@@ -55,6 +55,7 @@ impl SafetensorsFile {
             Some("gemma") | Some("gemma2") => Architecture::Gemma,
             Some("mixtral") => Architecture::Mixtral,
             Some("mamba") => Architecture::Mamba,
+            Some("rwkv") | Some("rwkv5") | Some("rwkv6") => Architecture::Rwkv,
             Some(other) => Architecture::Unknown(other.to_string()),
             None => Architecture::Unknown("unknown".to_string()),
         };

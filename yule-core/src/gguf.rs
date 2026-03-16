@@ -500,6 +500,7 @@ impl GgufFile {
             "gemma" | "gemma2" => Architecture::Gemma,
             "mixtral" => Architecture::Mixtral,
             "mamba" => Architecture::Mamba,
+            "rwkv" | "rwkv5" | "rwkv6" => Architecture::Rwkv,
             other => Architecture::Unknown(other.to_string()),
         };
 
