@@ -401,6 +401,35 @@ pub fn dequant_iq4_nl(block: &[u8], out: &mut [f32]) {
     }
 }
 
+// ─── Prefetch intrinsic for dequant kernels ─────────────────────────
+// Prefetches the next weight block into L1 cache while the current block
+// is being processed. On non-x86 architectures this is a no-op.
+
+/// Prefetch `data[offset..]` into L1 cache (T0 temporal hint).
+/// Used inside `vec_dot_*` loops to overlap memory latency with compute.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn prefetch_block(data: &[u8], offset: usize) {
+    if offset < data.len() {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        unsafe {
+            let ptr = data.as_ptr().add(offset) as *const i8;
+            _mm_prefetch(ptr, _MM_HINT_T0);
+            // Second cache line for blocks >64B (Q4_K=144B, Q6_K=210B)
+            if offset + 64 < data.len() {
+                _mm_prefetch(ptr.add(64), _MM_HINT_T0);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline(always)]
+pub fn prefetch_block(_data: &[u8], _offset: usize) {}
+
 // ─── Fused dot-product kernels (scalar) ──────────────────────────────
 // These compute dot(weights_block, activations) without materializing
 // dequantized weights. This is the hot path for GEMV.
@@ -445,6 +474,10 @@ pub fn vec_dot_q4_k(block: &[u8], act: &[f32]) -> f32 {
 
     let mut sum = 0.0f32;
     for j in 0..4 {
+        // Prefetch the next group's qs data while computing this group
+        let next_offset = 16 + 32 * (j + 1);
+        prefetch_block(block, next_offset);
+
         let qs = &block[16 + 32 * j..];
 
         // sub-block 2*j: low nibbles, weights at act[64*j .. 64*j+32]
@@ -484,6 +517,12 @@ pub fn vec_dot_q6_k(block: &[u8], act: &[f32]) -> f32 {
     let mut sum = 0.0f32;
 
     for half in 0..2 {
+        // Prefetch the second half's ql and qh data while computing the first
+        if half == 0 {
+            prefetch_block(block, 64);   // next half's ql
+            prefetch_block(block, 160);  // next half's qh (128 + 32)
+        }
+
         let ql = &block[half * 64..];
         let qh = &block[128 + half * 32..];
         let act_base = half * 128;
@@ -515,6 +554,10 @@ pub fn vec_dot_q2_k(block: &[u8], act: &[f32]) -> f32 {
     let mut sum = 0.0f32;
 
     for sb in 0..16 {
+        // Prefetch next sub-block's qs bytes
+        let next_qs_offset = 16 + (sb + 1) * 16 / 4;
+        prefetch_block(block, next_qs_offset);
+
         let scale = (block[sb] & 0x0F) as f32;
         let min = ((block[sb] >> 4) & 0x0F) as f32;
         let mut dot = 0.0f32;
@@ -557,6 +600,10 @@ pub fn vec_dot_q3_k(block: &[u8], act: &[f32]) -> f32 {
 
     let mut sum = 0.0f32;
     for sb in 0..16 {
+        // Prefetch next sub-block's qs and hmask bytes
+        let next_qs_offset = 32 + (sb + 1) * 16 / 4;
+        prefetch_block(block, next_qs_offset);
+
         let sc = scales[sb] as f32;
         let mut dot = 0.0f32;
         for k in 0..16 {
@@ -624,6 +671,73 @@ pub fn vec_dot_q5_k(block: &[u8], act: &[f32]) -> f32 {
     sum
 }
 
+/// Q4_1 fused dot product: dot(block, act[0..32]) → f32
+pub fn vec_dot_q4_1(block: &[u8], act: &[f32]) -> f32 {
+    debug_assert!(block.len() >= 20);
+    debug_assert!(act.len() >= 32);
+    let d = read_f16(block, 0);
+    let m = read_f16(block, 2);
+    let mut sum = 0.0f32;
+    let mut act_sum = 0.0f32;
+    for i in 0..32 {
+        let byte = block[4 + i / 2];
+        let nibble = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+        sum += nibble as f32 * act[i];
+        act_sum += act[i];
+    }
+    d * sum + m * act_sum
+}
+
+/// Q5_0 fused dot product: dot(block, act[0..32]) → f32
+pub fn vec_dot_q5_0(block: &[u8], act: &[f32]) -> f32 {
+    debug_assert!(block.len() >= 22);
+    debug_assert!(act.len() >= 32);
+    let d = read_f16(block, 0);
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    let mut sum = 0.0f32;
+    for i in 0..32 {
+        let byte = block[6 + i / 2];
+        let lo = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+        let hi = ((qh >> i) & 1) as u8;
+        let q = (hi << 4) | lo;
+        sum += (q as f32 - 16.0) * act[i];
+    }
+    sum * d
+}
+
+/// Q5_1 fused dot product: dot(block, act[0..32]) → f32
+pub fn vec_dot_q5_1(block: &[u8], act: &[f32]) -> f32 {
+    debug_assert!(block.len() >= 24);
+    debug_assert!(act.len() >= 32);
+    let d = read_f16(block, 0);
+    let m = read_f16(block, 2);
+    let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    let mut sum = 0.0f32;
+    let mut act_sum = 0.0f32;
+    for i in 0..32 {
+        let byte = block[8 + i / 2];
+        let lo = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+        let hi = ((qh >> i) & 1) as u8;
+        let q = (hi << 4) | lo;
+        sum += q as f32 * act[i];
+        act_sum += act[i];
+    }
+    d * sum + m * act_sum
+}
+
+/// Q8_1 fused dot product: dot(block, act[0..32]) → f32
+pub fn vec_dot_q8_1(block: &[u8], act: &[f32]) -> f32 {
+    debug_assert!(block.len() >= 36);
+    debug_assert!(act.len() >= 32);
+    let d = read_f16(block, 0);
+    let mut sum = 0.0f32;
+    for i in 0..32 {
+        let q = block[4 + i] as i8;
+        sum += q as f32 * act[i];
+    }
+    sum * d
+}
+
 /// IQ4_NL fused dot product: dot(block, act[0..32]) → f32
 pub fn vec_dot_iq4_nl(block: &[u8], act: &[f32]) -> f32 {
     debug_assert!(block.len() >= 18);
@@ -671,6 +785,25 @@ pub fn dequant_block(dtype: DType, block: &[u8], out: &mut [f32]) -> Result<()> 
         }
         DType::F32 => {
             out[0] = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        }
+        DType::IQ1_S
+        | DType::IQ1_M
+        | DType::IQ2_XXS
+        | DType::IQ2_XS
+        | DType::IQ2_S
+        | DType::IQ3_XXS
+        | DType::IQ3_S
+        | DType::IQ4_XS => {
+            return Err(YuleError::Inference(format!(
+                "I-quant dequant for {:?} requires codebook tables (not yet implemented)",
+                dtype
+            )));
+        }
+        DType::TQ1_0 | DType::TQ2_0 => {
+            return Err(YuleError::Inference(format!(
+                "ternary dequant for {:?} not yet implemented",
+                dtype
+            )));
         }
         _ => {
             return Err(YuleError::Inference(format!(
@@ -807,5 +940,238 @@ mod tests {
         let mut out = [0.0f32; 32];
         dequant_block(DType::Q8_0, &block, &mut out).unwrap();
         assert!((out[0] - 42.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_q4_1_dequant() {
+        // Q4_1: w = d * nibble + m
+        let mut block = [0u8; 20];
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0
+        block[2] = 0x00;
+        block[3] = 0x3C; // m = 1.0
+        // First byte: low nibble = 0, high nibble = 15
+        block[4] = 0xF0;
+        // Rest zeros
+
+        let mut out = [0.0f32; 32];
+        dequant_q4_1(&block, &mut out);
+
+        // weight 0: 0 * 1.0 + 1.0 = 1.0
+        assert!((out[0] - 1.0).abs() < 1e-6);
+        // weight 1: 15 * 1.0 + 1.0 = 16.0
+        assert!((out[1] - 16.0).abs() < 1e-6);
+        // weight 2: 0 * 1.0 + 1.0 = 1.0 (rest are zero nibbles)
+        assert!((out[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_q4_1_vec_dot() {
+        let mut block = [0u8; 20];
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0
+        block[2] = 0x00;
+        block[3] = 0x3C; // m = 1.0
+        // All nibbles = 0 → weight = 0*1 + 1 = 1.0
+        // (block[4..20] already zeros)
+
+        let act = [1.0f32; 32];
+        let dot = vec_dot_q4_1(&block, &act);
+        // 32 * 1.0 * 1.0 = 32.0
+        assert!((dot - 32.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_q5_0_dequant() {
+        // Q5_0: w = (q5 - 16) * d
+        let mut block = [0u8; 22];
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0
+        // qh at offset 2..6: bit 0 = 1, rest = 0
+        block[2] = 0x01;
+        block[3] = 0x00;
+        block[4] = 0x00;
+        block[5] = 0x00;
+        // qs at offset 6: first byte low nibble = 0, high nibble = 0
+        block[6] = 0x00;
+
+        let mut out = [0.0f32; 32];
+        dequant_q5_0(&block, &mut out);
+
+        // weight 0: lo=0, hi=1 (qh bit 0 set) → q5 = 16 → (16 - 16) * 1.0 = 0.0
+        assert!((out[0] - 0.0).abs() < 1e-6);
+        // weight 1: lo=0, hi=0 (qh bit 1 not set) → q5 = 0 → (0 - 16) * 1.0 = -16.0
+        assert!((out[1] - (-16.0)).abs() < 1e-6);
+
+        // Test with non-zero nibble: set qs byte at index 6 to 0x5A
+        block[6] = 0x5A;
+        // Also set qh bit 0 = 0 for this test
+        block[2] = 0x02; // bit 1 set, bit 0 clear
+        dequant_q5_0(&block, &mut out);
+        // weight 0: lo=0xA=10, hi=0 → q5=10 → (10-16)*1 = -6.0
+        assert!((out[0] - (-6.0)).abs() < 1e-6);
+        // weight 1: lo=0x5=5, hi=1 → q5=16+5=21 → (21-16)*1 = 5.0
+        assert!((out[1] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_q5_0_vec_dot() {
+        let mut block = [0u8; 22];
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0
+        // qh = 0 (all high bits zero)
+        // qs: all nibbles = 0 → q5 = 0 → weight = -16.0
+        let act = [1.0f32; 32];
+        let dot = vec_dot_q5_0(&block, &act);
+        // 32 * (-16.0) * 1.0 = -512.0
+        assert!((dot - (-512.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_q3_k_dequant() {
+        // Q3_K: 110 bytes, 256 weights
+        // Layout: hmask[0..32] + qs[32..96] + scales[96..108] + d[108..110]
+        let mut block = [0u8; 110];
+        // d = 1.0 at offset 108
+        block[108] = 0x00;
+        block[109] = 0x3C;
+
+        // Set all scales to raw value 32 → signed = 32 - 32 = 0
+        // With scale = 0, all weights should be 0 regardless of q values
+        // scales[12] at offset 96..108: leave as zeros
+        // raw = (lo | (hi << 4)), and with all zeros: raw = 0, scale = 0 - 32 = -32
+        // Actually let's set a known scale: raw = 33 → scale = 1
+        // For j=0: lo = block[96] & 0x0F, hi = (block[104] >> 0) & 0x03
+        // Set lo = 1 (block[96] & 0x0F = 1), hi = 2 → raw = 1 | (2<<4) = 33 → scale = 1
+        block[96] = 0x01; // lo nibble for scale[0] = 1
+        block[104] = 0x02; // hi bits for scale[0] = 2 (at shift 0)
+
+        // Set first weight (wi=0): qs 2 low bits = 1, hmask high bit = 0
+        // qs at offset 32 + 0/4 = 32, shift = 0 → set (block[32] >> 0) & 3 = 1
+        block[32] = 0x01;
+        // hmask bit 0 = 0 (already zero)
+        // q3 = (1 | (0 << 2)) - 4 = -3
+        // weight 0 = 1.0 * 1.0 * (-3.0) = -3.0
+
+        let mut out = [0.0f32; 256];
+        dequant_q3_k(&block, &mut out);
+        assert!(
+            (out[0] - (-3.0)).abs() < 1e-6,
+            "expected -3.0, got {}",
+            out[0]
+        );
+
+        // Set hmask bit 0 to 1: q3 = (1 | (1<<2)) - 4 = 5 - 4 = 1
+        block[0] = 0x01; // hmask byte 0, bit 0
+        dequant_q3_k(&block, &mut out);
+        assert!(
+            (out[0] - 1.0).abs() < 1e-6,
+            "expected 1.0, got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn test_q5_k_dequant() {
+        // Q5_K: 176 bytes, 256 weights
+        // Layout: d[0..2] + dmin[2..4] + scales[4..16] + qh[16..48] + qs[48..176]
+        let mut block = [0u8; 176];
+        // d = 1.0
+        block[0] = 0x00;
+        block[1] = 0x3C;
+        // dmin = 0.0 (simplify test)
+        block[2] = 0x00;
+        block[3] = 0x00;
+
+        // scales: set sc[0] = 1 via extract_q4k_scales_mins
+        // For j=0: sc[0] = q[0] & 63 → set block[4] = 1
+        block[4] = 0x01;
+
+        // qs at offset 48: first byte low nibble = 5
+        block[48] = 0x05;
+        // qh at offset 16: bit for weight 0 = 0 (u1 starts at 1, qh[0] & 1)
+        // Leave qh = 0 → 5th bit = 0
+
+        // weight 0: q = (5 & 0xF) + 0 = 5, w = 1.0 * 1.0 * 5 - 0 = 5.0
+        let mut out = [0.0f32; 256];
+        dequant_q5_k(&block, &mut out);
+        assert!(
+            (out[0] - 5.0).abs() < 1e-6,
+            "expected 5.0, got {}",
+            out[0]
+        );
+
+        // Set qh bit 0: q = 5 + 16 = 21
+        block[16] = 0x01;
+        dequant_q5_k(&block, &mut out);
+        assert!(
+            (out[0] - 21.0).abs() < 1e-6,
+            "expected 21.0, got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn test_iq4_nl_dequant_all_entries() {
+        // Verify the full codebook mapping
+        let mut block = [0u8; 18];
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0
+
+        // Set nibbles to cover indices 0..15 in sequence
+        for i in 0..8 {
+            let lo = (2 * i) as u8;
+            let hi = (2 * i + 1) as u8;
+            block[2 + i] = lo | (hi << 4);
+        }
+
+        let mut out = [0.0f32; 32];
+        dequant_iq4_nl(&block, &mut out);
+
+        let expected: [f32; 16] = [
+            -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0,
+            53.0, 69.0, 89.0, 113.0,
+        ];
+        for i in 0..16 {
+            assert!(
+                (out[i] - expected[i]).abs() < 1e-6,
+                "index {}: expected {}, got {}",
+                i,
+                expected[i],
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_q8_1_dequant() {
+        let mut block = [0u8; 36];
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0
+        // s at offset 2..4 (ignored for dequant)
+        block[4] = 42; // qs[0] = 42 as i8
+        block[5] = 0x80u8; // qs[1] = -128 as i8
+
+        let mut out = [0.0f32; 32];
+        dequant_q8_1(&block, &mut out);
+
+        assert!((out[0] - 42.0).abs() < 1e-6);
+        assert!((out[1] - (-128.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_iquant_errors() {
+        let block = [0u8; 256];
+        let mut out = [0.0f32; 256];
+        assert!(dequant_block(DType::IQ2_XXS, &block, &mut out).is_err());
+        assert!(dequant_block(DType::IQ2_XS, &block, &mut out).is_err());
+        assert!(dequant_block(DType::IQ2_S, &block, &mut out).is_err());
+        assert!(dequant_block(DType::IQ3_XXS, &block, &mut out).is_err());
+        assert!(dequant_block(DType::IQ3_S, &block, &mut out).is_err());
+        assert!(dequant_block(DType::IQ4_XS, &block, &mut out).is_err());
+        assert!(dequant_block(DType::IQ1_S, &block, &mut out).is_err());
+        assert!(dequant_block(DType::IQ1_M, &block, &mut out).is_err());
+        assert!(dequant_block(DType::TQ1_0, &block, &mut out).is_err());
+        assert!(dequant_block(DType::TQ2_0, &block, &mut out).is_err());
     }
 }
