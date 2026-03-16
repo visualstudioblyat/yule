@@ -16,5 +16,8 @@ zerocopy = { workspace = true }
 memmap2 = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win32_System_Threading"] }
+
 [build-dependencies]
 cc = "1"
