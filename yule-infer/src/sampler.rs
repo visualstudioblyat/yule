@@ -11,12 +11,31 @@ impl Sampler {
     }
 
     pub fn sample(&self, logits: &[f32]) -> Result<u32> {
+        self.sample_with_history(logits, &[])
+    }
+
+    pub fn sample_with_history(&self, logits: &[f32], previous_tokens: &[u32]) -> Result<u32> {
         let n = logits.len();
         if n == 0 {
             return Err(YuleError::Inference("empty logits".into()));
         }
 
         let mut logits = logits.to_vec();
+
+        // repetition penalty: divide logits of previously seen tokens
+        if self.params.repetition_penalty != 1.0 && !previous_tokens.is_empty() {
+            let penalty = self.params.repetition_penalty;
+            for &tok in previous_tokens {
+                let idx = tok as usize;
+                if idx < n {
+                    if logits[idx] > 0.0 {
+                        logits[idx] /= penalty;
+                    } else {
+                        logits[idx] *= penalty;
+                    }
+                }
+            }
+        }
 
         // temperature scaling
         if self.params.temperature > 0.0 && self.params.temperature != 1.0 {

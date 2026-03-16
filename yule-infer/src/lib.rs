@@ -142,11 +142,12 @@ impl InferenceEngine {
         // Create sampler
         let sampler = crate::sampler::Sampler::new(request.sampling.clone());
 
-        // Decode loop
+        // Decode loop — track all tokens for repetition penalty
+        let mut all_tokens = request.tokens.clone();
         let mut output_tokens = Vec::with_capacity(request.max_new_tokens as usize);
 
         for _ in 0..request.max_new_tokens {
-            let token = sampler.sample(&logits)?;
+            let token = sampler.sample_with_history(&logits, &all_tokens)?;
 
             // EOS check
             if let Some(eos) = request.eos_token {
@@ -156,6 +157,7 @@ impl InferenceEngine {
             }
 
             output_tokens.push(token);
+            all_tokens.push(token);
             logits = runner.decode_step(token)?;
         }
 
