@@ -45,6 +45,7 @@ pub struct GenerateRequest {
     pub max_new_tokens: u32,
     pub sampling: SamplingParams,
     pub eos_token: Option<u32>,
+    pub speculative: Option<crate::speculative::SpeculativeConfig>,
 }
 
 #[derive(Debug, Clone)]
