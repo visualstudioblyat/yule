@@ -2,6 +2,8 @@
 use crate::{BackendKind, BufferHandle, ComputeBackend, DeviceInfo, buffer::next_buffer_handle};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use yule_core::dequant;
+use yule_core::dtype::DType;
 use yule_core::error::{Result, YuleError};
 
 fn detect_system_ram() -> u64 {
@@ -9,10 +11,10 @@ fn detect_system_ram() -> u64 {
     {
         #[link(name = "kernel32")]
         unsafe extern "system" {
-            fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+            fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
         }
         #[repr(C)]
-        struct MEMORYSTATUSEX {
+        struct MemoryStatusEx {
             dw_length: u32,
             dw_memory_load: u32,
             ull_total_phys: u64,
@@ -23,8 +25,8 @@ fn detect_system_ram() -> u64 {
             ull_avail_virtual: u64,
             ull_avail_extended_virtual: u64,
         }
-        let mut status = MEMORYSTATUSEX {
-            dw_length: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
             dw_memory_load: 0,
             ull_total_phys: 0,
             ull_avail_phys: 0,
@@ -521,6 +523,58 @@ impl ComputeBackend for CpuBackend {
         Ok(())
     }
 
+    /// Quantized matrix-vector multiply: output[row] = dot(weights[row], input)
+    /// where weights are stored in quantized format (Q4_0, Q8_0, Q4_K, etc.)
+    /// and input/output are f32.
+    fn quantized_matmul(
+        &self,
+        weights: &BufferHandle,
+        input: &BufferHandle,
+        output: &BufferHandle,
+        n_rows: u32,
+        n_cols: u32,
+        dtype: DType,
+    ) -> Result<()> {
+        let block_size = dtype.block_size();
+        let block_bytes = dtype.size_of_block();
+        let n_rows = n_rows as usize;
+        let n_cols = n_cols as usize;
+        let blocks_per_row = n_cols / block_size;
+
+        let mut buffers = self.buffers.lock().unwrap();
+        let w_data = Self::get_buf(&buffers, weights)?.as_ptr();
+        let w_len = Self::get_buf(&buffers, weights)?.len();
+        let inp_data = Self::get_buf(&buffers, input)?.as_ptr();
+        let inp_len = Self::get_buf(&buffers, input)?.len();
+        let out_buf = Self::get_buf_mut(&mut buffers, output)?;
+        let out_f32 = as_f32_slice_mut(out_buf);
+
+        // SAFETY: pointers stay valid while lock is held, and output is distinct
+        let weight_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(w_data, w_len) };
+        let inp_f32: &[f32] =
+            bytemuck::cast_slice(unsafe { std::slice::from_raw_parts(inp_data, inp_len) });
+
+        for row in 0..n_rows {
+            let mut sum = 0.0f32;
+            let row_offset = row * blocks_per_row * block_bytes;
+            for b in 0..blocks_per_row {
+                let block_start = row_offset + b * block_bytes;
+                let block = &weight_bytes[block_start..block_start + block_bytes];
+                let act_start = b * block_size;
+                let act = &inp_f32[act_start..act_start + block_size];
+
+                sum += dequant::vec_dot_block(dtype, block, act).unwrap_or_else(|_| {
+                    let mut tmp = vec![0.0f32; block_size];
+                    let _ = dequant::dequant_block(dtype, block, &mut tmp);
+                    tmp.iter().zip(act.iter()).map(|(w, a)| w * a).sum::<f32>()
+                });
+            }
+            out_f32[row] = sum;
+        }
+        Ok(())
+    }
+
     fn synchronize(&self) -> Result<()> {
         Ok(()) // CPU is synchronous
     }
@@ -917,6 +971,83 @@ mod tests {
 
         assert!((result[0] - expected_0).abs() < 1e-3);
         assert!((result[1] - expected_1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_quantized_matmul_q4_0() {
+        use yule_core::dtype::DType;
+
+        let b = CpuBackend::new();
+        let dtype = DType::Q4_0;
+        let block_size = dtype.block_size(); // 32
+        let block_bytes = dtype.size_of_block(); // 18
+
+        // 2 rows, 32 columns (1 block per row)
+        let n_rows: u32 = 2;
+        let n_cols: u32 = block_size as u32;
+        let blocks_per_row = 1usize;
+
+        // Build quantized weight data: 2 rows * 1 block * 18 bytes = 36 bytes
+        let mut weight_data = vec![0u8; n_rows as usize * blocks_per_row * block_bytes];
+
+        // Row 0: d=1.0 (f16 0x3C00), all nibbles = 9 → weight = (9-8)*1.0 = 1.0
+        weight_data[0] = 0x00;
+        weight_data[1] = 0x3C;
+        for i in 0..16 {
+            weight_data[2 + i] = 0x99;
+        }
+
+        // Row 1: d=0.5 (f16 0x3800), all nibbles = 10 → weight = (10-8)*0.5 = 1.0
+        let row1_off = block_bytes;
+        weight_data[row1_off] = 0x00;
+        weight_data[row1_off + 1] = 0x38;
+        for i in 0..16 {
+            weight_data[row1_off + 2 + i] = 0xAA;
+        }
+
+        // Allocate buffers
+        let weights_handle = b.allocate(weight_data.len()).unwrap();
+        b.copy_to_device(&weight_data, &weights_handle).unwrap();
+
+        let input_handle = b.allocate(n_cols as usize * 4).unwrap();
+        write_f32(&b, &input_handle, &vec![1.0f32; n_cols as usize]);
+
+        let output_handle = b.allocate(n_rows as usize * 4).unwrap();
+
+        b.quantized_matmul(&weights_handle, &input_handle, &output_handle, n_rows, n_cols, dtype)
+            .unwrap();
+
+        let result = read_f32(&b, &output_handle, n_rows as usize);
+
+        // Row 0: 32 weights of 1.0 dot 32 inputs of 1.0 = 32.0
+        assert!(
+            (result[0] - 32.0).abs() < 1e-2,
+            "row 0: expected 32.0, got {}",
+            result[0]
+        );
+
+        // Row 1: 32 weights of 1.0 dot 32 inputs of 1.0 = 32.0
+        assert!(
+            (result[1] - 32.0).abs() < 1e-2,
+            "row 1: expected 32.0, got {}",
+            result[1]
+        );
+
+        // Verify against manual dequant + dot
+        for row in 0..n_rows as usize {
+            let row_offset = row * blocks_per_row * block_bytes;
+            let block = &weight_data[row_offset..row_offset + block_bytes];
+            let mut dequantized = vec![0.0f32; block_size];
+            yule_core::dequant::dequant_block(dtype, block, &mut dequantized).unwrap();
+            let manual_dot: f32 = dequantized.iter().zip(std::iter::repeat(1.0f32)).map(|(w, a)| w * a).sum();
+            assert!(
+                (result[row] - manual_dot).abs() < 1e-4,
+                "row {}: quantized_matmul={} vs manual={}",
+                row,
+                result[row],
+                manual_dot
+            );
+        }
     }
 
     #[test]
