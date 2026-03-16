@@ -4,6 +4,7 @@ pub mod gpu_runner;
 pub mod kv_cache;
 pub mod mamba;
 pub mod model_runner;
+pub mod rwkv;
 pub mod sampler;
 pub mod speculative;
 pub mod weight_loader;
