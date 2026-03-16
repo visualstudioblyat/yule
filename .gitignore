@@ -13,6 +13,9 @@ yule-docs/.next/
 yule-docs/node_modules/
 yule-docs/.source/
 
+# claude config
+.claude/
+
 # OS junk
 Thumbs.db
 nul
