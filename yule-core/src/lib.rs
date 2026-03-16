@@ -1,3 +1,4 @@
+pub mod async_io;
 pub mod chat_template;
 pub mod dequant;
 pub mod dtype;
