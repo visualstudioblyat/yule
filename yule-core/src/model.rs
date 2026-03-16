@@ -10,6 +10,7 @@ pub enum Architecture {
     Gemma,
     Mixtral,
     Mamba,
+    Rwkv,
     Unknown(String),
 }
 

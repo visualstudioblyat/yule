@@ -245,20 +245,17 @@ impl<'a> TransformerWeights<'a> {
 
     /// Packed all-experts gate projections [n_experts * ff_dim, dim]
     pub fn ffn_gate_exps(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
-        self.store
-            .get(&format!("blk.{layer}.ffn_gate_exps.weight"))
+        self.store.get(&format!("blk.{layer}.ffn_gate_exps.weight"))
     }
 
     /// Packed all-experts up projections
     pub fn ffn_up_exps(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
-        self.store
-            .get(&format!("blk.{layer}.ffn_up_exps.weight"))
+        self.store.get(&format!("blk.{layer}.ffn_up_exps.weight"))
     }
 
     /// Packed all-experts down projections
     pub fn ffn_down_exps(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
-        self.store
-            .get(&format!("blk.{layer}.ffn_down_exps.weight"))
+        self.store.get(&format!("blk.{layer}.ffn_down_exps.weight"))
     }
 
     /// Check if this model uses Mixture of Experts

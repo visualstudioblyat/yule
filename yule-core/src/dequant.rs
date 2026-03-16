@@ -401,6 +401,117 @@ pub fn dequant_iq4_nl(block: &[u8], out: &mut [f32]) {
     }
 }
 
+// ─── Ternary (BitNet-style) dequantization ──────────────────────────
+
+/// TQ2_0: 256 weights, 2-bit ternary. 66 bytes per block.
+/// Layout: [qs: 64B (256 2-bit values)] + [d: f16 (2B)]
+/// Encoding: 00→-1, 01→0, 10→+1, 11→unused
+/// Dequant: w_i = d * trit_value
+pub fn dequant_tq2_0(block: &[u8], out: &mut [f32]) {
+    debug_assert!(block.len() >= 66);
+    debug_assert!(out.len() >= 256);
+    let d = read_f16(block, 64);
+    for i in 0..256 {
+        let byte_idx = i / 4;
+        let bit_shift = 2 * (i % 4);
+        let bits = (block[byte_idx] >> bit_shift) & 0x03;
+        let trit = match bits {
+            0b00 => -1.0f32,
+            0b01 => 0.0f32,
+            0b10 => 1.0f32,
+            _ => 0.0f32, // 0b11 unused, treat as zero
+        };
+        out[i] = d * trit;
+    }
+}
+
+/// TQ1_0: 256 weights, base-3 packed ternary. 54 bytes per block.
+/// Layout: 32 bytes of base-3 packed trits (5 trits per byte, 160 trits from 32 bytes)
+/// + 4 bytes (qh, extra trits for remaining 96 weights via 5-trit groups in 20 bytes)
+/// + f16 scale (2B) + padding
+///
+/// Actually, the GGML TQ1_0 layout packs 256 weights into ~34 bytes of trit data:
+///   - qs[0..32]: 32 bytes, each holds 5 trits in base-3 (160 trits)
+///   - qs[32..52]: 20 bytes, each holds 5 trits in base-3 (100 trits, only 96 used)
+///   - d: f16 at offset 52 (2 bytes)
+///
+/// Total: 54 bytes. Values: trit 0 -> -1, 1 -> 0, 2 -> +1
+pub fn dequant_tq1_0(block: &[u8], out: &mut [f32]) {
+    debug_assert!(block.len() >= 54);
+    debug_assert!(out.len() >= 256);
+    let d = read_f16(block, 52);
+
+    let mut wi = 0usize;
+    // Process all 52 bytes of trit data (52 * 5 = 260 trits, we use 256)
+    for byte_idx in 0..52 {
+        let mut val = block[byte_idx] as u32;
+        for _ in 0..5 {
+            if wi >= 256 {
+                break;
+            }
+            let trit = val % 3;
+            val /= 3;
+            // 0 → -1, 1 → 0, 2 → +1
+            let w = trit as f32 - 1.0;
+            out[wi] = d * w;
+            wi += 1;
+        }
+        if wi >= 256 {
+            break;
+        }
+    }
+}
+
+// ─── Ternary fused dot-product kernels ──────────────────────────────
+
+/// TQ2_0 fused dot product: dot(block of 256, act[0..256]) → f32
+pub fn vec_dot_tq2_0(block: &[u8], act: &[f32]) -> f32 {
+    debug_assert!(block.len() >= 66);
+    debug_assert!(act.len() >= 256);
+    let d = read_f16(block, 64);
+    let mut sum = 0.0f32;
+    for i in 0..256 {
+        let byte_idx = i / 4;
+        let bit_shift = 2 * (i % 4);
+        let bits = (block[byte_idx] >> bit_shift) & 0x03;
+        let trit = match bits {
+            0b00 => -1.0f32,
+            0b01 => 0.0f32,
+            0b10 => 1.0f32,
+            _ => 0.0f32,
+        };
+        sum += trit * act[i];
+    }
+    sum * d
+}
+
+/// TQ1_0 fused dot product: dot(block of 256, act[0..256]) → f32
+pub fn vec_dot_tq1_0(block: &[u8], act: &[f32]) -> f32 {
+    debug_assert!(block.len() >= 54);
+    debug_assert!(act.len() >= 256);
+    let d = read_f16(block, 52);
+    let mut sum = 0.0f32;
+
+    let mut wi = 0usize;
+    for byte_idx in 0..52 {
+        let mut val = block[byte_idx] as u32;
+        for _ in 0..5 {
+            if wi >= 256 {
+                break;
+            }
+            let trit = val % 3;
+            val /= 3;
+            let w = trit as f32 - 1.0;
+            sum += w * act[wi];
+            wi += 1;
+        }
+        if wi >= 256 {
+            break;
+        }
+    }
+    sum * d
+}
+
 // ─── Prefetch intrinsic for dequant kernels ─────────────────────────
 // Prefetches the next weight block into L1 cache while the current block
 // is being processed. On non-x86 architectures this is a no-op.
@@ -519,8 +630,8 @@ pub fn vec_dot_q6_k(block: &[u8], act: &[f32]) -> f32 {
     for half in 0..2 {
         // Prefetch the second half's ql and qh data while computing the first
         if half == 0 {
-            prefetch_block(block, 64);   // next half's ql
-            prefetch_block(block, 160);  // next half's qh (128 + 32)
+            prefetch_block(block, 64); // next half's ql
+            prefetch_block(block, 160); // next half's qh (128 + 32)
         }
 
         let ql = &block[half * 64..];
@@ -638,6 +749,10 @@ pub fn vec_dot_q5_k(block: &[u8], act: &[f32]) -> f32 {
     let mut u2: u8 = 2;
 
     for j in 0..4 {
+        // Prefetch the next group's ql data while computing this group
+        let next_ql_offset = 48 + 32 * (j + 1);
+        prefetch_block(block, next_ql_offset);
+
         let ql = &block[48 + 32 * j..];
 
         // sub-block is: low nibbles + 5th bit
@@ -799,12 +914,8 @@ pub fn dequant_block(dtype: DType, block: &[u8], out: &mut [f32]) -> Result<()> 
                 dtype
             )));
         }
-        DType::TQ1_0 | DType::TQ2_0 => {
-            return Err(YuleError::Inference(format!(
-                "ternary dequant for {:?} not yet implemented",
-                dtype
-            )));
-        }
+        DType::TQ1_0 => dequant_tq1_0(block, out),
+        DType::TQ2_0 => dequant_tq2_0(block, out),
         _ => {
             return Err(YuleError::Inference(format!(
                 "dequant not yet implemented for {:?}",
@@ -1064,11 +1175,7 @@ mod tests {
         // Set hmask bit 0 to 1: q3 = (1 | (1<<2)) - 4 = 5 - 4 = 1
         block[0] = 0x01; // hmask byte 0, bit 0
         dequant_q3_k(&block, &mut out);
-        assert!(
-            (out[0] - 1.0).abs() < 1e-6,
-            "expected 1.0, got {}",
-            out[0]
-        );
+        assert!((out[0] - 1.0).abs() < 1e-6, "expected 1.0, got {}", out[0]);
     }
 
     #[test]
@@ -1095,11 +1202,7 @@ mod tests {
         // weight 0: q = (5 & 0xF) + 0 = 5, w = 1.0 * 1.0 * 5 - 0 = 5.0
         let mut out = [0.0f32; 256];
         dequant_q5_k(&block, &mut out);
-        assert!(
-            (out[0] - 5.0).abs() < 1e-6,
-            "expected 5.0, got {}",
-            out[0]
-        );
+        assert!((out[0] - 5.0).abs() < 1e-6, "expected 5.0, got {}", out[0]);
 
         // Set qh bit 0: q = 5 + 16 = 21
         block[16] = 0x01;
@@ -1129,8 +1232,8 @@ mod tests {
         dequant_iq4_nl(&block, &mut out);
 
         let expected: [f32; 16] = [
-            -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0,
-            53.0, 69.0, 89.0, 113.0,
+            -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0,
+            69.0, 89.0, 113.0,
         ];
         for i in 0..16 {
             assert!(
@@ -1171,7 +1274,196 @@ mod tests {
         assert!(dequant_block(DType::IQ4_XS, &block, &mut out).is_err());
         assert!(dequant_block(DType::IQ1_S, &block, &mut out).is_err());
         assert!(dequant_block(DType::IQ1_M, &block, &mut out).is_err());
-        assert!(dequant_block(DType::TQ1_0, &block, &mut out).is_err());
-        assert!(dequant_block(DType::TQ2_0, &block, &mut out).is_err());
+    }
+
+    #[test]
+    fn test_tq2_0_dequant() {
+        // TQ2_0: 66 bytes, 256 weights
+        // Layout: [qs: 64B] [d: f16 (2B)]
+        // Encoding: 00→-1, 01→0, 10→+1
+        let mut block = [0u8; 66];
+        // d = 2.0 in f16 = 0x4000 LE = [0x00, 0x40]
+        block[64] = 0x00;
+        block[65] = 0x40;
+
+        // First byte: encode 4 trits
+        // trit0 = -1 (00), trit1 = 0 (01), trit2 = +1 (10), trit3 = -1 (00)
+        // byte = 00 | (01 << 2) | (10 << 4) | (00 << 6) = 0b00_10_01_00 = 0x24
+        block[0] = 0x24;
+        // Rest of qs = 0x00 → all trits are 00 = -1
+
+        let mut out = [0.0f32; 256];
+        dequant_tq2_0(&block, &mut out);
+
+        // weight 0: d * (-1) = 2.0 * (-1.0) = -2.0
+        assert!(
+            (out[0] - (-2.0)).abs() < 1e-6,
+            "w0: expected -2.0, got {}",
+            out[0]
+        );
+        // weight 1: d * 0 = 0.0
+        assert!(
+            (out[1] - 0.0).abs() < 1e-6,
+            "w1: expected 0.0, got {}",
+            out[1]
+        );
+        // weight 2: d * 1 = 2.0
+        assert!(
+            (out[2] - 2.0).abs() < 1e-6,
+            "w2: expected 2.0, got {}",
+            out[2]
+        );
+        // weight 3: d * (-1) = -2.0
+        assert!(
+            (out[3] - (-2.0)).abs() < 1e-6,
+            "w3: expected -2.0, got {}",
+            out[3]
+        );
+        // weight 4 onward (byte 1 = 0x00 → all 00 = -1): d * (-1) = -2.0
+        assert!(
+            (out[4] - (-2.0)).abs() < 1e-6,
+            "w4: expected -2.0, got {}",
+            out[4]
+        );
+    }
+
+    #[test]
+    fn test_tq2_0_vec_dot() {
+        let mut block = [0u8; 66];
+        // d = 1.0
+        block[64] = 0x00;
+        block[65] = 0x3C;
+        // All qs bytes = 0x00 → all trits = 00 = -1
+        // dot(-1 * 256, act=1.0 * 256) = -256.0
+
+        let act = [1.0f32; 256];
+        let dot = vec_dot_tq2_0(&block, &act);
+        assert!(
+            (dot - (-256.0)).abs() < 1e-4,
+            "expected -256.0, got {}",
+            dot
+        );
+    }
+
+    #[test]
+    fn test_tq1_0_dequant() {
+        // TQ1_0: 54 bytes, 256 weights
+        // Base-3 packed: each byte holds 5 trits (byte % 3, byte/3 % 3, ...)
+        // Values: 0→-1, 1→0, 2→+1
+        let mut block = [0u8; 54];
+        // d = 1.0 at offset 52
+        block[52] = 0x00;
+        block[53] = 0x3C;
+
+        // Encode first byte: 5 trits
+        // trit0=2(+1), trit1=1(0), trit2=0(-1), trit3=2(+1), trit4=1(0)
+        // byte = 2 + 1*3 + 0*9 + 2*27 + 1*81 = 2 + 3 + 0 + 54 + 81 = 140
+        block[0] = 140;
+
+        // Second byte: all trits = 0 (-1)
+        // byte = 0 + 0*3 + 0*9 + 0*27 + 0*81 = 0
+        block[1] = 0;
+
+        let mut out = [0.0f32; 256];
+        dequant_tq1_0(&block, &mut out);
+
+        // weight 0: trit=2 → +1, w = 1.0 * 1.0 = 1.0
+        assert!(
+            (out[0] - 1.0).abs() < 1e-6,
+            "w0: expected 1.0, got {}",
+            out[0]
+        );
+        // weight 1: trit=1 → 0, w = 0.0
+        assert!(
+            (out[1] - 0.0).abs() < 1e-6,
+            "w1: expected 0.0, got {}",
+            out[1]
+        );
+        // weight 2: trit=0 → -1, w = -1.0
+        assert!(
+            (out[2] - (-1.0)).abs() < 1e-6,
+            "w2: expected -1.0, got {}",
+            out[2]
+        );
+        // weight 3: trit=2 → +1, w = 1.0
+        assert!(
+            (out[3] - 1.0).abs() < 1e-6,
+            "w3: expected 1.0, got {}",
+            out[3]
+        );
+        // weight 4: trit=1 → 0, w = 0.0
+        assert!(
+            (out[4] - 0.0).abs() < 1e-6,
+            "w4: expected 0.0, got {}",
+            out[4]
+        );
+        // weight 5 (from byte 1 = 0): trit=0 → -1, w = -1.0
+        assert!(
+            (out[5] - (-1.0)).abs() < 1e-6,
+            "w5: expected -1.0, got {}",
+            out[5]
+        );
+    }
+
+    #[test]
+    fn test_tq1_0_vec_dot() {
+        let mut block = [0u8; 54];
+        // d = 1.0
+        block[52] = 0x00;
+        block[53] = 0x3C;
+        // All qs bytes = 0 → all trits = 0 → value = -1
+        // dot(-1 * 256, act=1.0 * 256) = -256.0
+
+        let act = [1.0f32; 256];
+        let dot = vec_dot_tq1_0(&block, &act);
+        assert!(
+            (dot - (-256.0)).abs() < 1e-4,
+            "expected -256.0, got {}",
+            dot
+        );
+    }
+
+    #[test]
+    fn test_tq1_0_dispatch() {
+        let mut block = [0u8; 54];
+        block[52] = 0x00;
+        block[53] = 0x3C; // d = 1.0
+        // byte 0 = 121: trits = 121%3=1(0), 40%3=1(0), 13%3=1(0), 4%3=1(0), 1%3=1(0)
+        // → all 5 trits are 1 → value 0
+        block[0] = 121;
+
+        let mut out = [0.0f32; 256];
+        dequant_block(DType::TQ1_0, &block, &mut out).unwrap();
+        // First 5 weights should all be 0
+        for i in 0..5 {
+            assert!(
+                (out[i] - 0.0).abs() < 1e-6,
+                "w{}: expected 0.0, got {}",
+                i,
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_tq2_0_dispatch() {
+        let mut block = [0u8; 66];
+        block[64] = 0x00;
+        block[65] = 0x3C; // d = 1.0
+        // All qs = 0x55 → bits 01_01_01_01 → all trits = 0
+        for i in 0..64 {
+            block[i] = 0x55;
+        }
+
+        let mut out = [0.0f32; 256];
+        dequant_block(DType::TQ2_0, &block, &mut out).unwrap();
+        for i in 0..256 {
+            assert!(
+                (out[i] - 0.0).abs() < 1e-6,
+                "w{}: expected 0.0, got {}",
+                i,
+                out[i]
+            );
+        }
     }
 }
