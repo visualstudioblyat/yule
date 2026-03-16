@@ -532,6 +532,171 @@ impl PagedKvManager {
     }
 }
 
+/// Streaming KV cache with attention sink retention.
+/// Always keeps the first `num_sink_tokens` in cache, plus a sliding window
+/// of the most recent tokens. Enables infinite-length generation with fixed memory.
+///
+/// Layout: `[sink_0, sink_1, ..., sink_N, window_0, window_1, ..., window_W]`
+///
+/// The attention sink phenomenon: the first few tokens (typically 4) receive
+/// disproportionate attention weight (measured at 148x concentration ratio).
+/// When these tokens are evicted from a sliding window KV cache, output quality
+/// collapses. This cache prevents that by never evicting sink tokens.
+///
+/// Reference: "Efficient Streaming Language Models with Attention Sinks" (ICLR 2024)
+pub struct StreamingKvCache {
+    pub num_layers: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub num_sink_tokens: u32,
+    pub window_size: u32,
+    pub total_capacity: u32,
+    pub tokens_seen: u64,
+    /// Per-layer key storage: `[total_capacity * num_kv_heads * head_dim]`
+    key_data: Vec<Vec<f32>>,
+    /// Per-layer value storage: `[total_capacity * num_kv_heads * head_dim]`
+    value_data: Vec<Vec<f32>>,
+}
+
+impl StreamingKvCache {
+    /// Create a new streaming KV cache.
+    ///
+    /// - `num_sink_tokens`: number of initial tokens to always retain (typically 4).
+    /// - `window_size`: number of recent tokens to keep in the sliding window.
+    pub fn new(
+        num_layers: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        num_sink_tokens: u32,
+        window_size: u32,
+    ) -> Self {
+        let total_capacity = num_sink_tokens + window_size;
+        let slot_size = total_capacity as usize * num_kv_heads as usize * head_dim as usize;
+
+        let mut key_data = Vec::with_capacity(num_layers as usize);
+        let mut value_data = Vec::with_capacity(num_layers as usize);
+        for _ in 0..num_layers {
+            key_data.push(vec![0.0f32; slot_size]);
+            value_data.push(vec![0.0f32; slot_size]);
+        }
+
+        Self {
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            num_sink_tokens,
+            window_size,
+            total_capacity,
+            tokens_seen: 0,
+            key_data,
+            value_data,
+        }
+    }
+
+    /// Write KV for a new token. If we're past capacity:
+    /// - Sink tokens (positions `0..num_sink_tokens`) are NEVER overwritten
+    /// - Window tokens rotate: oldest window token is evicted, new one appended
+    ///
+    /// `k` and `v` must each have `num_kv_heads * head_dim` elements.
+    pub fn write_kv(&mut self, layer: u32, k: &[f32], v: &[f32]) {
+        let stride = self.num_kv_heads as usize * self.head_dim as usize;
+        assert_eq!(k.len(), stride, "k length must be num_kv_heads * head_dim");
+        assert_eq!(v.len(), stride, "v length must be num_kv_heads * head_dim");
+        assert!(
+            (layer as usize) < self.num_layers as usize,
+            "layer index out of range"
+        );
+
+        let layer_idx = layer as usize;
+        let cap = self.total_capacity as usize;
+        let sink = self.num_sink_tokens as usize;
+        // For layer 0 we use tokens_seen directly; for subsequent layers the count
+        // was already bumped by the layer-0 write, so subtract 1 to get the same
+        // logical position.
+        let seen = if layer == 0 {
+            self.tokens_seen as usize
+        } else {
+            (self.tokens_seen - 1) as usize
+        };
+
+        let write_pos = if seen < cap {
+            // Still filling slots (sink region or window region)
+            seen
+        } else {
+            // Window is full — shift window slots left by 1, then write at end
+            for i in sink..(cap - 1) {
+                let dst_start = i * stride;
+                let src_start = (i + 1) * stride;
+                // Copy within the same vec: use split_at_mut to avoid aliasing
+                let (left, right) = self.key_data[layer_idx].split_at_mut(src_start);
+                left[dst_start..dst_start + stride].copy_from_slice(&right[..stride]);
+
+                let (left, right) = self.value_data[layer_idx].split_at_mut(src_start);
+                left[dst_start..dst_start + stride].copy_from_slice(&right[..stride]);
+            }
+            cap - 1
+        };
+
+        let offset = write_pos * stride;
+        self.key_data[layer_idx][offset..offset + stride].copy_from_slice(k);
+        self.value_data[layer_idx][offset..offset + stride].copy_from_slice(v);
+
+        // Only bump tokens_seen once per token (on layer 0)
+        if layer == 0 {
+            self.tokens_seen += 1;
+        }
+    }
+
+    /// Read K values for all cached positions (sinks + window).
+    /// Returns a contiguous slice of `[effective_len * num_kv_heads * head_dim]`.
+    pub fn read_k(&self, layer: u32) -> &[f32] {
+        let stride = self.num_kv_heads as usize * self.head_dim as usize;
+        let len = self.effective_len() as usize * stride;
+        &self.key_data[layer as usize][..len]
+    }
+
+    /// Read V values for all cached positions.
+    /// Returns a contiguous slice of `[effective_len * num_kv_heads * head_dim]`.
+    pub fn read_v(&self, layer: u32) -> &[f32] {
+        let stride = self.num_kv_heads as usize * self.head_dim as usize;
+        let len = self.effective_len() as usize * stride;
+        &self.value_data[layer as usize][..len]
+    }
+
+    /// Current effective sequence length for attention computation.
+    /// `min(tokens_seen, total_capacity)`.
+    pub fn effective_len(&self) -> u32 {
+        std::cmp::min(self.tokens_seen as u32, self.total_capacity)
+    }
+
+    /// Total tokens that have been processed (may exceed capacity).
+    pub fn tokens_seen(&self) -> u64 {
+        self.tokens_seen
+    }
+
+    /// Size in bytes of the streaming KV cache.
+    pub fn size_bytes(&self) -> u64 {
+        // Per layer: 2 (K+V) * total_capacity * num_kv_heads * head_dim * 4 bytes
+        let per_layer =
+            2u64 * self.total_capacity as u64 * self.num_kv_heads as u64 * self.head_dim as u64 * 4;
+        per_layer * self.num_layers as u64
+    }
+
+    /// Reset all state.
+    pub fn clear(&mut self) {
+        self.tokens_seen = 0;
+        for layer_idx in 0..self.num_layers as usize {
+            self.key_data[layer_idx].fill(0.0);
+            self.value_data[layer_idx].fill(0.0);
+        }
+    }
+
+    /// Check if we're in streaming mode (more tokens seen than capacity).
+    pub fn is_streaming(&self) -> bool {
+        self.tokens_seen > self.total_capacity as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,6 +1035,168 @@ mod tests {
         cache.clear();
         assert_eq!(cache.current_len, 0);
         assert_eq!(cache.remaining_tokens(), max_seq_len);
+    }
+
+    #[test]
+    fn test_streaming_kv_sink_retention() {
+        // 4 sinks + 6 window = 10 total capacity, 2 layers, 2 heads, dim 4
+        let num_layers = 2u32;
+        let num_kv_heads = 2u32;
+        let head_dim = 4u32;
+        let num_sink_tokens = 4u32;
+        let window_size = 6u32;
+        let stride = (num_kv_heads * head_dim) as usize;
+
+        let mut cache = StreamingKvCache::new(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            num_sink_tokens,
+            window_size,
+        );
+
+        // Generate unique KV data for each token: value = token_index + 1
+        let make_kv = |token: usize| -> Vec<f32> { vec![(token + 1) as f32; stride] };
+
+        // Write 100 tokens across all layers
+        for t in 0..100usize {
+            let kv = make_kv(t);
+            for layer in 0..num_layers {
+                cache.write_kv(layer, &kv, &kv);
+            }
+        }
+
+        // Verify sinks 0-3 are unchanged from their original values
+        for layer in 0..num_layers {
+            let k = cache.read_k(layer);
+            for sink_idx in 0..num_sink_tokens as usize {
+                let expected = (sink_idx + 1) as f32;
+                let offset = sink_idx * stride;
+                for d in 0..stride {
+                    assert_eq!(
+                        k[offset + d],
+                        expected,
+                        "Sink token {} corrupted in layer {} at dim {}",
+                        sink_idx,
+                        layer,
+                        d
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_streaming_kv_window_rotation() {
+        let num_layers = 1u32;
+        let num_kv_heads = 1u32;
+        let head_dim = 2u32;
+        let num_sink_tokens = 4u32;
+        let window_size = 6u32;
+        let stride = (num_kv_heads * head_dim) as usize;
+
+        let mut cache = StreamingKvCache::new(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            num_sink_tokens,
+            window_size,
+        );
+
+        let make_kv = |token: usize| -> Vec<f32> { vec![(token + 1) as f32; stride] };
+
+        // Write 100 tokens
+        for t in 0..100usize {
+            let kv = make_kv(t);
+            cache.write_kv(0, &kv, &kv);
+        }
+
+        // Window should contain the most recent 6 tokens: 94..100 (values 95..101)
+        let k = cache.read_k(0);
+        let v = cache.read_v(0);
+        let total_cap = (num_sink_tokens + window_size) as usize;
+        assert_eq!(k.len(), total_cap * stride);
+
+        for w in 0..window_size as usize {
+            let slot = num_sink_tokens as usize + w;
+            let expected_token = 100 - window_size as usize + w; // 94, 95, ..., 99
+            let expected_val = (expected_token + 1) as f32;
+            let offset = slot * stride;
+            for d in 0..stride {
+                assert_eq!(
+                    k[offset + d],
+                    expected_val,
+                    "Window slot {} should have token {} (val {}), got {}",
+                    w,
+                    expected_token,
+                    expected_val,
+                    k[offset + d]
+                );
+                assert_eq!(v[offset + d], expected_val);
+            }
+        }
+    }
+
+    #[test]
+    fn test_streaming_kv_effective_len() {
+        let mut cache = StreamingKvCache::new(1, 1, 2, 4, 6);
+        let stride = 2;
+        let kv = vec![1.0f32; stride];
+
+        // Before capacity: effective_len = tokens_seen
+        for t in 0..10u64 {
+            assert_eq!(cache.effective_len(), t as u32);
+            cache.write_kv(0, &kv, &kv);
+        }
+        assert_eq!(cache.effective_len(), 10); // == total_capacity
+
+        // After capacity: effective_len stays at total_capacity
+        for _ in 0..20 {
+            cache.write_kv(0, &kv, &kv);
+        }
+        assert_eq!(cache.effective_len(), 10);
+        assert_eq!(cache.tokens_seen(), 30);
+    }
+
+    #[test]
+    fn test_streaming_kv_is_streaming() {
+        let mut cache = StreamingKvCache::new(1, 1, 2, 4, 6);
+        let kv = vec![1.0f32; 2];
+
+        // Under capacity: not streaming
+        for _ in 0..10 {
+            assert!(!cache.is_streaming());
+            cache.write_kv(0, &kv, &kv);
+        }
+        // At exactly capacity (10 seen, 10 cap): not streaming
+        assert!(!cache.is_streaming());
+
+        // Over capacity: streaming
+        cache.write_kv(0, &kv, &kv);
+        assert!(cache.is_streaming());
+    }
+
+    #[test]
+    fn test_streaming_kv_size() {
+        let num_layers = 2u32;
+        let num_kv_heads = 4u32;
+        let head_dim = 64u32;
+        let num_sink_tokens = 4u32;
+        let window_size = 1020u32;
+
+        let cache = StreamingKvCache::new(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            num_sink_tokens,
+            window_size,
+        );
+
+        let total_cap = (num_sink_tokens + window_size) as u64; // 1024
+        // per layer: 2 * 1024 * 4 * 64 * 4 = 2,097,152
+        let expected =
+            2u64 * total_cap * num_kv_heads as u64 * head_dim as u64 * 4 * num_layers as u64;
+        assert_eq!(cache.size_bytes(), expected);
     }
 
     #[test]
