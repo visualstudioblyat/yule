@@ -136,6 +136,21 @@ impl DType {
         (self.size_of_block() as f32 * 8.0) / self.block_size() as f32
     }
 
+    /// Convert from SafeTensors dtype string to DType.
+    pub fn from_safetensors_dtype(s: &str) -> Option<DType> {
+        match s {
+            "F64" => Some(DType::F64),
+            "F32" => Some(DType::F32),
+            "F16" => Some(DType::F16),
+            "BF16" => Some(DType::BF16),
+            "I64" => Some(DType::I64),
+            "I32" => Some(DType::I32),
+            "I16" => Some(DType::I16),
+            "I8" => Some(DType::I8),
+            _ => None,
+        }
+    }
+
     /// Convert from GGUF type ID to DType.
     pub fn from_gguf_type_id(id: u32) -> Option<DType> {
         match id {
