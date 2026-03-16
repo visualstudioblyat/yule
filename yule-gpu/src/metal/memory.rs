@@ -8,7 +8,7 @@ use super::device::MetalDeviceWrapper;
 use crate::BufferHandle;
 
 pub struct MetalMemoryManager {
-    buffers: Mutex<HashMap<u64, MTLBuffer>>,
+    pub(super) buffers: Mutex<HashMap<u64, MTLBuffer>>,
     next_id: Mutex<u64>,
 }
 
