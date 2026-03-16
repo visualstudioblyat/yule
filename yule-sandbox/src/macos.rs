@@ -41,10 +41,84 @@ impl Sandbox for MacOsSandbox {
         Ok(SandboxGuard { _marker: () })
     }
 
-    fn spawn(&self, _config: &SandboxConfig) -> Result<SandboxedProcess> {
-        Err(YuleError::Sandbox(
-            "macos sandbox spawn not yet implemented".into(),
-        ))
+    fn spawn(&self, config: &SandboxConfig) -> Result<SandboxedProcess> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let exe = std::env::current_exe()
+            .map_err(|e| YuleError::Sandbox(format!("cannot determine current exe: {e}")))?;
+
+        let max_memory = config.max_memory_bytes;
+        let profile = build_seatbelt_profile(config);
+
+        let mut cmd = Command::new(&exe);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        // SAFETY: pre_exec runs after fork, before exec in the child process.
+        // We apply the seatbelt sandbox profile and rlimit so the exec'd
+        // process is already confined.
+        unsafe {
+            cmd.pre_exec(move || {
+                // 1. memory limit
+                let limit = libc::rlimit {
+                    rlim_cur: max_memory as libc::rlim_t,
+                    rlim_max: max_memory as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+
+                // 2. seatbelt profile
+                let c_profile = match CString::new(profile.as_str()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("seatbelt profile contains null byte: {e}"),
+                        ));
+                    }
+                };
+
+                let mut errorbuf: *mut c_char = ptr::null_mut();
+                let ret = sandbox_init(c_profile.as_ptr(), 0, &mut errorbuf);
+
+                if ret != 0 {
+                    let msg = if !errorbuf.is_null() {
+                        let err = CStr::from_ptr(errorbuf).to_string_lossy().into_owned();
+                        sandbox_free_error(errorbuf);
+                        err
+                    } else {
+                        "unknown error".to_string()
+                    };
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("sandbox_init failed: {msg}"),
+                    ));
+                }
+
+                Ok(())
+            });
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| YuleError::Sandbox(format!("failed to spawn sandboxed process: {e}")))?;
+
+        let pid = child.id();
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| YuleError::Sandbox("failed to capture child stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| YuleError::Sandbox("failed to capture child stdout".into()))?;
+
+        tracing::info!(pid, "sandboxed child process spawned");
+
+        Ok(SandboxedProcess { pid, stdin, stdout })
     }
 }
 

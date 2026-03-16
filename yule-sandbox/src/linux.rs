@@ -58,10 +58,83 @@ impl Sandbox for LinuxSandbox {
         Ok(SandboxGuard { _marker: () })
     }
 
-    fn spawn(&self, _config: &SandboxConfig) -> Result<SandboxedProcess> {
-        Err(YuleError::Sandbox(
-            "linux sandbox spawn not yet implemented".into(),
-        ))
+    fn spawn(&self, config: &SandboxConfig) -> Result<SandboxedProcess> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let exe = std::env::current_exe()
+            .map_err(|e| YuleError::Sandbox(format!("cannot determine current exe: {e}")))?;
+
+        // Clone config values needed inside the pre_exec closure
+        let max_memory = config.max_memory_bytes;
+        let allow_gpu = config.allow_gpu;
+        let allow_network = config.allow_network;
+        let model_path = config.model_path.clone();
+
+        let child_config = SandboxConfig {
+            model_path,
+            allow_gpu,
+            max_memory_bytes: max_memory,
+            allow_network,
+        };
+
+        let mut cmd = Command::new(&exe);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        // SAFETY: pre_exec runs after fork, before exec in the child process.
+        // We apply sandbox restrictions so the exec'd process is already confined.
+        // All functions called here are async-signal-safe or the process will exec
+        // immediately after.
+        unsafe {
+            cmd.pre_exec(move || {
+                // 1. memory limit
+                let limit = libc::rlimit {
+                    rlim_cur: child_config.max_memory_bytes as libc::rlim_t,
+                    rlim_max: child_config.max_memory_bytes as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+
+                // 2. landlock (best-effort — may not be supported)
+                let landlock_applied = match apply_landlock(&child_config) {
+                    Ok(applied) => applied,
+                    Err(_) => false,
+                };
+
+                // 3. no_new_privs (required before seccomp if landlock didn't set it)
+                if !landlock_applied {
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+
+                // 4. seccomp (best-effort)
+                let _ = apply_seccomp(&child_config);
+
+                Ok(())
+            });
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| YuleError::Sandbox(format!("failed to spawn sandboxed process: {e}")))?;
+
+        let pid = child.id();
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| YuleError::Sandbox("failed to capture child stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| YuleError::Sandbox("failed to capture child stdout".into()))?;
+
+        tracing::info!(pid, "sandboxed child process spawned");
+
+        Ok(SandboxedProcess { pid, stdin, stdout })
     }
 }
 

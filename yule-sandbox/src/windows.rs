@@ -179,9 +179,7 @@ fn spawn_in_job(config: &SandboxConfig) -> Result<SandboxedProcess> {
             CloseHandle(child_stdin_wr);
             CloseHandle(child_stdout_rd);
             CloseHandle(child_stdout_wr);
-            return Err(YuleError::Sandbox(format!(
-                "CreateProcessW failed: {err}"
-            )));
+            return Err(YuleError::Sandbox(format!("CreateProcessW failed: {err}")));
         }
 
         // Close the child-side pipe ends in the parent
