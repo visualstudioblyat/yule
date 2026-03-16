@@ -194,15 +194,30 @@ impl ComputeBackend for CpuBackend {
 
         let (m, n, k) = (m as usize, n as usize, k as usize);
 
-        // Naive GEMM: C[i,j] = sum_p A[i,p] * B[p,j]
-        // For m=1 this is a GEMV and dominates inference time.
+        // Tiled GEMM for cache efficiency. Tile size chosen to fit in L1 cache.
+        // For GEMV (m=1), the inner loop is just a dot product.
+        const TILE: usize = 64;
         for i in 0..m {
             for j in 0..n {
-                let mut sum = 0.0f32;
-                for p in 0..k {
-                    sum += a_f32[i * k + p] * b_f32[p * n + j];
+                out_f32[i * n + j] = 0.0;
+            }
+        }
+        for p0 in (0..k).step_by(TILE) {
+            let p1 = (p0 + TILE).min(k);
+            for i0 in (0..m).step_by(TILE) {
+                let i1 = (i0 + TILE).min(m);
+                for j0 in (0..n).step_by(TILE) {
+                    let j1 = (j0 + TILE).min(n);
+                    for i in i0..i1 {
+                        for j in j0..j1 {
+                            let mut sum = 0.0f32;
+                            for p in p0..p1 {
+                                sum += a_f32[i * k + p] * b_f32[p * n + j];
+                            }
+                            out_f32[i * n + j] += sum;
+                        }
+                    }
                 }
-                out_f32[i * n + j] = sum;
             }
         }
         Ok(())
