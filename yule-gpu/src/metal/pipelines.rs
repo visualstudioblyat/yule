@@ -16,7 +16,7 @@ impl MetalPipelineManager {
             .new_library_with_source(MSL_SOURCE, &options)
             .map_err(|e| YuleError::Gpu(format!("MSL compilation failed: {e}")))?;
 
-        let kernel_names: [&str; 12] = [
+        let kernel_names: [&str; 13] = [
             "add_kernel",
             "silu_mul_kernel",
             "rms_norm_kernel",
@@ -29,6 +29,7 @@ impl MetalPipelineManager {
             "qmv_q8_0_kernel",
             "qmv_q4_k_kernel",
             "qmv_q6_k_kernel",
+            "matmul_kernel",
         ];
 
         let mut pipelines = HashMap::new();

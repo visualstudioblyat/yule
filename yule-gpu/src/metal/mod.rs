@@ -130,17 +130,27 @@ impl ComputeBackend for MetalBackend {
 
     fn matmul(
         &self,
-        _a: &BufferHandle,
-        _b: &BufferHandle,
-        _out: &BufferHandle,
-        _m: u32,
-        _n: u32,
-        _k: u32,
+        a: &BufferHandle,
+        b: &BufferHandle,
+        out: &BufferHandle,
+        m: u32,
+        n: u32,
+        k: u32,
     ) -> Result<()> {
-        // Dense f32 matmul not implemented; quantized_matmul is the hot path.
-        Err(YuleError::Gpu(
-            "metal matmul: use quantized_matmul instead".into(),
-        ))
+        #[repr(C)]
+        struct MatmulParams {
+            m: u32,
+            n: u32,
+            k: u32,
+        }
+        let params = MatmulParams { m, n, k };
+        self.dispatch_simple(
+            "matmul_kernel",
+            &[a, b, out],
+            &params,
+            (m, 1, 1),
+            (256, 1, 1),
+        )
     }
 
     fn add(

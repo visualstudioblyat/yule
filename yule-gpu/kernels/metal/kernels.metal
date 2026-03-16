@@ -582,3 +582,43 @@ kernel void qmv_q6_k_kernel(
     }
     if (tid == 0) out[row] = partial_sums[0];
 }
+
+// ── Dense f32 GEMV: out[row] = A[row,:] · b[:] ──────────────────────────
+
+struct MatmulParams {
+    uint m;
+    uint n;
+    uint k;
+};
+
+kernel void matmul_kernel(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant MatmulParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    constexpr uint tpg = 256;
+    threadgroup float partial_sums[tpg];
+
+    if (row >= params.m) return;
+
+    float sum = 0.0f;
+    // GEMV path (n=1 or general): C[row,j] = sum_p A[row,p] * B[p,j]
+    // For single-token decode n=1, this reduces to dot product
+    for (uint j = 0; j < params.n; j++) {
+        float dot = 0.0f;
+        for (uint p = tid; p < params.k; p += tpg) {
+            dot += a[row * params.k + p] * b[p * params.n + j];
+        }
+        partial_sums[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tpg / 2; s > 0; s >>= 1) {
+            if (tid < s) partial_sums[tid] += partial_sums[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) out[row * params.n + j] = partial_sums[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
