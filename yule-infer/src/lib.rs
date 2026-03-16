@@ -14,9 +14,7 @@ use yule_gpu::ComputeBackend;
 use crate::model_runner::ModelRunner;
 
 pub struct InferenceEngine {
-    #[allow(dead_code)]
     backend: Box<dyn ComputeBackend>,
-    #[allow(dead_code)]
     config: InferenceConfig,
     // runner MUST be declared before weight_data so it gets dropped first
     // (runner borrows from weight_data; Rust drops fields in declaration order)
@@ -70,6 +68,10 @@ impl Default for SamplingParams {
 }
 
 impl InferenceEngine {
+    pub fn device_info(&self) -> yule_gpu::DeviceInfo {
+        self.backend.device_info()
+    }
+
     pub fn new(backend: Box<dyn ComputeBackend>, config: InferenceConfig) -> Self {
         Self {
             backend,

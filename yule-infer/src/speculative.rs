@@ -158,7 +158,7 @@ pub fn speculative_decode_step(
     // Since we used the full model for drafting, target == draft (all accepted).
     // This wiring is correct for when we add LayerSkip draft generation.
     let target_logits_final = current_logits;
-    let target_probs_final = logits_to_probs(&target_logits_final, temperature);
+    let _target_probs_final = logits_to_probs(&target_logits_final, temperature);
 
     // For now, with full-model drafting, all tokens are accepted by construction.
     // The rejection sampling infrastructure is exercised for correctness.
