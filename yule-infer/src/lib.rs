@@ -1,5 +1,6 @@
 pub mod attention;
 pub mod batch;
+pub mod constant_time;
 #[cfg(feature = "vulkan")]
 pub mod gpu_runner;
 pub mod kv_cache;
