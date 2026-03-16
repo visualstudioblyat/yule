@@ -32,7 +32,7 @@ struct RunnerConfig {
     rope_freq_base: f32,
     max_seq_len: usize,
     sliding_window: Option<usize>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // stored for inspection; rotary_dim is baked into RopeTable
     partial_rotary_dim: Option<usize>,
     has_qkv_bias: bool,
     activation: Activation,

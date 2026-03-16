@@ -99,6 +99,7 @@ pub struct PagedKvCache {
     pub head_dim: u32,
     pub num_pages: u32,
     page_table: Vec<Vec<Option<BufferHandle>>>,
+    #[allow(dead_code)] // populated by future page fault handler
     logical_to_physical: Vec<Vec<Option<u32>>>,
 }
 
