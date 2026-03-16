@@ -1,4 +1,5 @@
 pub mod policy;
+pub mod tee;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
