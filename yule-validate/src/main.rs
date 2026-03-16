@@ -46,50 +46,54 @@ fn main() {
             std::process::exit(1);
         }
     };
-    println!("Loading model from: {}", model_path.display());
-
-    let loaded = match model::load_model(&model_path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to load model: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    println!(
-        "Model: {:?}, {} layers, {} vocab",
-        loaded.model_info.metadata.architecture,
-        loaded.model_info.metadata.layer_count,
-        loaded.model_info.metadata.vocab_size,
-    );
-
-    // Create runner
-    let mut test_runner = match model::create_runner(&model_path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to create runner: {e}");
-            std::process::exit(1);
-        }
-    };
-
     println!();
     println!("Running validation suite...");
     println!();
 
-    // Infrastructure tests (32-37) — don't need model runner
+    // Infrastructure tests (32-37) — don't need model at all
     for r in infrastructure::run_all(&should_run) {
         results.push(r);
     }
 
-    // Correctness tests (1-21) — need model + runner
-    for r in correctness::run_all(&loaded, &mut test_runner, &should_run) {
-        results.push(r);
-    }
+    // Load model + runner only if needed
+    let needs_model = (1..=31).any(|id| should_run(id));
+    if needs_model {
+        println!("Loading model from: {}", model_path.display());
 
-    // Performance tests (22-31)
-    if !cli.skip_perf {
-        for r in performance::run_all(&loaded, &mut test_runner, &model_path, &should_run) {
+        let loaded = match model::load_model(&model_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to load model: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        println!(
+            "Model: {:?}, {} layers, {} vocab",
+            loaded.model_info.metadata.architecture,
+            loaded.model_info.metadata.layer_count,
+            loaded.model_info.metadata.vocab_size,
+        );
+
+        println!("Creating inference runner...");
+        let mut test_runner = match model::create_runner(&model_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Failed to create runner: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        // Correctness tests (1-21)
+        for r in correctness::run_all(&loaded, &mut test_runner, &should_run) {
             results.push(r);
+        }
+
+        // Performance tests (22-31)
+        if !cli.skip_perf {
+            for r in performance::run_all(&loaded, &mut test_runner, &model_path, &should_run) {
+                results.push(r);
+            }
         }
     }
 
