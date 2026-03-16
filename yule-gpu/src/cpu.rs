@@ -4,6 +4,88 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use yule_core::error::{Result, YuleError};
 
+fn detect_system_ram() -> u64 {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+        }
+        #[repr(C)]
+        struct MEMORYSTATUSEX {
+            dw_length: u32,
+            dw_memory_load: u32,
+            ull_total_phys: u64,
+            ull_avail_phys: u64,
+            ull_total_page_file: u64,
+            ull_avail_page_file: u64,
+            ull_total_virtual: u64,
+            ull_avail_virtual: u64,
+            ull_avail_extended_virtual: u64,
+        }
+        let mut status = MEMORYSTATUSEX {
+            dw_length: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            dw_memory_load: 0,
+            ull_total_phys: 0,
+            ull_avail_phys: 0,
+            ull_total_page_file: 0,
+            ull_avail_page_file: 0,
+            ull_total_virtual: 0,
+            ull_avail_virtual: 0,
+            ull_avail_extended_virtual: 0,
+        };
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        if ok != 0 {
+            return status.ull_total_phys;
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+            for line in contents.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    let rest = rest.trim();
+                    if let Some(kb_str) = rest.strip_suffix("kB") {
+                        if let Ok(kb) = kb_str.trim().parse::<u64>() {
+                            return kb * 1024;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn sysctl(
+                name: *const i32,
+                namelen: u32,
+                oldp: *mut u8,
+                oldlenp: *mut usize,
+                newp: *const u8,
+                newlen: usize,
+            ) -> i32;
+        }
+        let mut mib: [i32; 2] = [6 /* CTL_HW */, 24 /* HW_MEMSIZE */];
+        let mut memsize: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let ret = unsafe {
+            sysctl(
+                mib.as_mut_ptr(),
+                2,
+                &mut memsize as *mut u64 as *mut u8,
+                &mut len,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if ret == 0 {
+            return memsize;
+        }
+    }
+    0
+}
+
 pub struct CpuBackend {
     buffers: Mutex<HashMap<u64, Vec<u8>>>,
 }
@@ -58,7 +140,7 @@ impl ComputeBackend for CpuBackend {
         DeviceInfo {
             name: "CPU".into(),
             backend: BackendKind::Cpu,
-            memory_bytes: 0, // TODO: detect system RAM
+            memory_bytes: detect_system_ram(),
             compute_units: std::thread::available_parallelism()
                 .map(|p| p.get() as u32)
                 .unwrap_or(1),
