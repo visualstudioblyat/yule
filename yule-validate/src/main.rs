@@ -3,6 +3,7 @@ mod infrastructure;
 mod model;
 mod performance;
 mod report;
+mod research;
 
 use clap::Parser;
 use report::{TestResult, print_json, print_report};
@@ -56,7 +57,7 @@ fn main() {
     }
 
     // Load model + runner only if needed
-    let needs_model = (1..=31).any(&should_run);
+    let needs_model = (1..=31).any(&should_run) || (50..=55).any(&should_run);
     if needs_model {
         println!("Loading model from: {}", model_path.display());
 
@@ -94,6 +95,11 @@ fn main() {
             for r in performance::run_all(&loaded, &mut test_runner, &model_path, &should_run) {
                 results.push(r);
             }
+        }
+
+        // Research validation tests (50-55)
+        for r in research::run_all(&loaded, &mut test_runner, &should_run) {
+            results.push(r);
         }
     }
 
