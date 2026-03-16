@@ -54,13 +54,8 @@ impl BufferPool {
         }
 
         let handle = next_buffer_handle();
-        self.allocated.insert(
-            handle.0,
-            AllocatedBuffer {
-                size,
-                in_use: true,
-            },
-        );
+        self.allocated
+            .insert(handle.0, AllocatedBuffer { size, in_use: true });
         self.total_bytes += size as u64;
         Some(handle)
     }

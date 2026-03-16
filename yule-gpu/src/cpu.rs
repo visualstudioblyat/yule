@@ -550,8 +550,7 @@ impl ComputeBackend for CpuBackend {
         let out_f32 = as_f32_slice_mut(out_buf);
 
         // SAFETY: pointers stay valid while lock is held, and output is distinct
-        let weight_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(w_data, w_len) };
+        let weight_bytes: &[u8] = unsafe { std::slice::from_raw_parts(w_data, w_len) };
         let inp_f32: &[f32] =
             bytemuck::cast_slice(unsafe { std::slice::from_raw_parts(inp_data, inp_len) });
 
@@ -1014,8 +1013,15 @@ mod tests {
 
         let output_handle = b.allocate(n_rows as usize * 4).unwrap();
 
-        b.quantized_matmul(&weights_handle, &input_handle, &output_handle, n_rows, n_cols, dtype)
-            .unwrap();
+        b.quantized_matmul(
+            &weights_handle,
+            &input_handle,
+            &output_handle,
+            n_rows,
+            n_cols,
+            dtype,
+        )
+        .unwrap();
 
         let result = read_f32(&b, &output_handle, n_rows as usize);
 
@@ -1039,7 +1045,11 @@ mod tests {
             let block = &weight_data[row_offset..row_offset + block_bytes];
             let mut dequantized = vec![0.0f32; block_size];
             yule_core::dequant::dequant_block(dtype, block, &mut dequantized).unwrap();
-            let manual_dot: f32 = dequantized.iter().zip(std::iter::repeat(1.0f32)).map(|(w, a)| w * a).sum();
+            let manual_dot: f32 = dequantized
+                .iter()
+                .zip(std::iter::repeat(1.0f32))
+                .map(|(w, a)| w * a)
+                .sum();
             assert!(
                 (result[row] - manual_dot).abs() < 1e-4,
                 "row {}: quantized_matmul={} vs manual={}",
