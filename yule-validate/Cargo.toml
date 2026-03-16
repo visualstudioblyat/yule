@@ -1,0 +1,32 @@
+[package]
+name = "yule-validate"
+description = "Empirical validation suite: downloads a real model, tests every claim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "yule-validate"
+path = "src/main.rs"
+
+[dependencies]
+yule-core = { workspace = true }
+yule-verify = { workspace = true }
+yule-registry = { workspace = true }
+yule-sandbox = { workspace = true }
+yule-gpu = { workspace = true, features = ["cpu"] }
+yule-infer = { workspace = true, features = ["cpu"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+memmap2 = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+bytemuck = { workspace = true }
+getrandom = { workspace = true }
+serde_json = { workspace = true }

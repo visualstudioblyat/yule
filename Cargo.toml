@@ -11,6 +11,7 @@ members = [
     "yule-api",
     "yule-cli",
     "yule-bench",
+    "yule-validate",
 ]
 
 [workspace.package]
