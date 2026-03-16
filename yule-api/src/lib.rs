@@ -1,6 +1,9 @@
 pub mod auth;
+pub mod device_auth;
 pub mod inference;
+pub mod key_storage;
 pub mod routes;
+pub mod transport;
 pub mod types;
 #[cfg(kani)]
 mod verification;
