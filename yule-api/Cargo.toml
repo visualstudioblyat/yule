@@ -21,6 +21,7 @@ tokio = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }
+curve25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 tokio-stream = { workspace = true }
