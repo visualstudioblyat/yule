@@ -11,10 +11,17 @@ use yule_core::error::Result;
 use yule_core::model::LoadedModel;
 use yule_gpu::ComputeBackend;
 
-#[allow(dead_code)]
+use crate::model_runner::ModelRunner;
+
 pub struct InferenceEngine {
+    #[allow(dead_code)]
     backend: Box<dyn ComputeBackend>,
+    #[allow(dead_code)]
     config: InferenceConfig,
+    // runner MUST be declared before weight_data so it gets dropped first
+    // (runner borrows from weight_data; Rust drops fields in declaration order)
+    runner: Option<Box<dyn ModelRunner>>,
+    weight_data: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +44,7 @@ pub struct GenerateRequest {
     pub tokens: Vec<u32>,
     pub max_new_tokens: u32,
     pub sampling: SamplingParams,
+    pub eos_token: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,20 +70,95 @@ impl Default for SamplingParams {
 
 impl InferenceEngine {
     pub fn new(backend: Box<dyn ComputeBackend>, config: InferenceConfig) -> Self {
-        Self { backend, config }
+        Self {
+            backend,
+            config,
+            runner: None,
+            weight_data: None,
+        }
     }
 
-    pub fn load_model(&mut self, _model: &LoadedModel, _weights: &[u8]) -> Result<()> {
-        // TODO: load weight tensors into compute backend buffers
-        todo!("model loading into compute backend")
+    pub fn load_model(&mut self, _model: &LoadedModel, weights: &[u8]) -> Result<()> {
+        use crate::model_runner::TransformerRunner;
+        use crate::weight_loader::{TransformerWeights, WeightStore};
+        use yule_core::gguf::GgufParser;
+
+        // Own the weight data
+        self.weight_data = Some(weights.to_vec());
+
+        // SAFETY: weight_data lives in self and runner is dropped before weight_data
+        // (field declaration order guarantees drop order in Rust)
+        let static_ref: &'static [u8] = unsafe {
+            std::mem::transmute::<&[u8], &'static [u8]>(
+                self.weight_data.as_ref().unwrap().as_slice(),
+            )
+        };
+
+        // Parse GGUF
+        let parser = GgufParser::new();
+        let gguf = parser.parse_bytes(static_ref, static_ref.len() as u64)?;
+
+        // Build weight store and runner
+        let store = WeightStore::from_gguf(&gguf, static_ref)?;
+        let weights = TransformerWeights::new(store);
+
+        // Create runner based on backend
+        let runner: Box<dyn ModelRunner> = {
+            #[cfg(feature = "vulkan")]
+            {
+                use yule_gpu::BackendKind;
+                if self.backend.device_info().backend == BackendKind::Vulkan {
+                    Box::new(crate::gpu_runner::GpuTransformerRunner::new(weights)?)
+                } else {
+                    Box::new(TransformerRunner::new(weights)?)
+                }
+            }
+            #[cfg(not(feature = "vulkan"))]
+            {
+                Box::new(TransformerRunner::new(weights)?)
+            }
+        };
+
+        self.runner = Some(runner);
+        Ok(())
     }
 
-    pub fn generate(&self, _request: &GenerateRequest) -> Result<Vec<u32>> {
-        // TODO: autoregressive generation loop
-        // 1. prefill: process all input tokens
-        // 2. decode: generate one token at a time
-        // 3. apply sampling
-        // 4. check for EOS
-        todo!("token generation")
+    pub fn generate(&mut self, request: &GenerateRequest) -> Result<Vec<u32>> {
+        let runner = self
+            .runner
+            .as_mut()
+            .ok_or_else(|| yule_core::error::YuleError::Inference("model not loaded".into()))?;
+
+        runner.reset();
+
+        // Prefill input tokens
+        if request.tokens.is_empty() {
+            return Err(yule_core::error::YuleError::Inference(
+                "empty input tokens".into(),
+            ));
+        }
+        let mut logits = runner.prefill(&request.tokens)?;
+
+        // Create sampler
+        let sampler = crate::sampler::Sampler::new(request.sampling.clone());
+
+        // Decode loop
+        let mut output_tokens = Vec::with_capacity(request.max_new_tokens as usize);
+
+        for _ in 0..request.max_new_tokens {
+            let token = sampler.sample(&logits)?;
+
+            // EOS check
+            if let Some(eos) = request.eos_token {
+                if token == eos {
+                    break;
+                }
+            }
+
+            output_tokens.push(token);
+            logits = runner.decode_step(token)?;
+        }
+
+        Ok(output_tokens)
     }
 }
