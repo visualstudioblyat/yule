@@ -112,7 +112,27 @@ fn translate_hf_name(hf_name: &str) -> String {
                 "pre_feedforward_layernorm.weight" => "ffn_norm.weight",
                 "post_feedforward_layernorm.weight" => "ffn_post_norm.weight",
                 "post_self_attn_layernorm.weight" => "attn_post_norm.weight",
-                other => return format!("blk.{layer_num}.{other}"),
+                "block_sparse_moe.gate.weight" => "ffn_gate_inp.weight",
+                other => {
+                    // Mixtral expert tensors:
+                    // block_sparse_moe.experts.{E}.w1.weight -> ffn_gate.{E}.weight
+                    // block_sparse_moe.experts.{E}.w2.weight -> ffn_down.{E}.weight
+                    // block_sparse_moe.experts.{E}.w3.weight -> ffn_up.{E}.weight
+                    if let Some(rest) = other.strip_prefix("block_sparse_moe.experts.") {
+                        if let Some(dot2) = rest.find('.') {
+                            let expert_num = &rest[..dot2];
+                            let w_suffix = &rest[dot2 + 1..];
+                            let mapped_w = match w_suffix {
+                                "w1.weight" => "ffn_gate",
+                                "w2.weight" => "ffn_down",
+                                "w3.weight" => "ffn_up",
+                                _ => return format!("blk.{layer_num}.{other}"),
+                            };
+                            return format!("blk.{layer_num}.{mapped_w}.{expert_num}.weight");
+                        }
+                    }
+                    return format!("blk.{layer_num}.{other}");
+                }
             };
             return format!("blk.{layer_num}.{mapped}");
         }
@@ -195,5 +215,54 @@ impl<'a> TransformerWeights<'a> {
     }
     pub fn ffn_post_norm(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
         self.store.get(&format!("blk.{layer}.ffn_post_norm.weight"))
+    }
+
+    // MoE (Mixture of Experts) weight accessors
+
+    /// Router / gating network weights [n_experts, dim]
+    pub fn ffn_gate_inp(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
+        self.store
+            .require(&format!("blk.{layer}.ffn_gate_inp.weight"))
+    }
+
+    /// Individual expert gate projection (per-expert naming)
+    pub fn ffn_gate_expert(&self, layer: u32, expert: u32) -> Option<(&TensorInfo, &[u8])> {
+        self.store
+            .get(&format!("blk.{layer}.ffn_gate.{expert}.weight"))
+    }
+
+    /// Individual expert up projection (per-expert naming)
+    pub fn ffn_up_expert(&self, layer: u32, expert: u32) -> Option<(&TensorInfo, &[u8])> {
+        self.store
+            .get(&format!("blk.{layer}.ffn_up.{expert}.weight"))
+    }
+
+    /// Individual expert down projection (per-expert naming)
+    pub fn ffn_down_expert(&self, layer: u32, expert: u32) -> Option<(&TensorInfo, &[u8])> {
+        self.store
+            .get(&format!("blk.{layer}.ffn_down.{expert}.weight"))
+    }
+
+    /// Packed all-experts gate projections [n_experts * ff_dim, dim]
+    pub fn ffn_gate_exps(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
+        self.store
+            .get(&format!("blk.{layer}.ffn_gate_exps.weight"))
+    }
+
+    /// Packed all-experts up projections
+    pub fn ffn_up_exps(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
+        self.store
+            .get(&format!("blk.{layer}.ffn_up_exps.weight"))
+    }
+
+    /// Packed all-experts down projections
+    pub fn ffn_down_exps(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
+        self.store
+            .get(&format!("blk.{layer}.ffn_down_exps.weight"))
+    }
+
+    /// Check if this model uses Mixture of Experts
+    pub fn is_moe(&self) -> bool {
+        self.store.meta.expert_count.is_some_and(|n| n > 0)
     }
 }

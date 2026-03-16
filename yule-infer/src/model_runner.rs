@@ -41,6 +41,8 @@ struct RunnerConfig {
     logit_softcap: Option<f32>,
     attn_logit_softcap: Option<f32>,
     norm_weight_offset: f32,
+    n_experts: u32,
+    n_experts_used: u32,
 }
 
 struct ScratchBuffers {
@@ -56,6 +58,8 @@ struct ScratchBuffers {
     ffn_out: Vec<f32>,
     logits: Vec<f32>,
     post_norm_tmp: Vec<f32>,
+    router_logits: Vec<f32>,
+    expert_out: Vec<f32>,
 }
 
 struct RopeTable {
@@ -273,7 +277,20 @@ impl<'a> TransformerRunner<'a> {
         let head_dim = dim / n_heads;
         let max_seq_len = meta.context_length as usize;
 
-        let ff_dim = if let Ok((info, _)) = weights.ffn_gate(0) {
+        let n_experts = meta.expert_count.unwrap_or(0);
+        let n_experts_used = meta.expert_used_count.unwrap_or(0);
+        let is_moe = n_experts > 0;
+
+        let ff_dim = if is_moe {
+            // For MoE, try packed expert weights first, then individual expert
+            if let Some((info, _)) = weights.ffn_gate_exps(0) {
+                info.shape[1] as usize / n_experts as usize
+            } else if let Some((info, _)) = weights.ffn_gate_expert(0, 0) {
+                info.shape[1] as usize
+            } else {
+                ((dim as f64 * 8.0 / 3.0 / 256.0).ceil() as usize) * 256
+            }
+        } else if let Ok((info, _)) = weights.ffn_gate(0) {
             info.shape[1] as usize
         } else {
             ((dim as f64 * 8.0 / 3.0 / 256.0).ceil() as usize) * 256
@@ -325,6 +342,8 @@ impl<'a> TransformerRunner<'a> {
             logit_softcap: meta.logit_softcap,
             attn_logit_softcap: meta.attn_logit_softcap,
             norm_weight_offset: if is_gemma { 1.0 } else { 0.0 },
+            n_experts,
+            n_experts_used,
         };
 
         let kv_len = max_seq_len * n_kv_heads * head_dim;
@@ -344,6 +363,8 @@ impl<'a> TransformerRunner<'a> {
             ffn_out: vec![0.0; dim],
             logits: vec![0.0; cfg.vocab_size],
             post_norm_tmp: vec![0.0; dim],
+            router_logits: vec![0.0; n_experts as usize],
+            expert_out: vec![0.0; dim],
         };
 
         let rope = RopeTable::new(max_seq_len, rotary_dim, cfg.rope_freq_base);
@@ -557,27 +578,156 @@ impl<'a> TransformerRunner<'a> {
             );
 
             let ff = self.cfg.ff_dim;
-            let (gi, gd) = self.weights.ffn_gate(layer as u32)?;
-            let (ui, ud) = self.weights.ffn_up(layer as u32)?;
-            qmv(gi, gd, &self.scratch.normed, &mut self.scratch.gate[..ff])?;
-            qmv(ui, ud, &self.scratch.normed, &mut self.scratch.up[..ff])?;
 
-            match self.cfg.activation {
-                Activation::SwiGLU => {
-                    for i in 0..ff {
-                        let sigmoid = 1.0 / (1.0 + (-self.scratch.gate[i]).exp());
-                        self.scratch.gate[i] = self.scratch.gate[i] * sigmoid * self.scratch.up[i];
+            if self.cfg.n_experts > 0 {
+                // Mixture of Experts FFN
+                let n_exp = self.cfg.n_experts as usize;
+                let n_used = self.cfg.n_experts_used as usize;
+
+                // Router: matmul hidden state with gating weights → [n_experts]
+                let (ri, rd) = self.weights.ffn_gate_inp(layer as u32)?;
+                qmv(ri, rd, &self.scratch.normed, &mut self.scratch.router_logits[..n_exp])?;
+
+                // Softmax over router logits
+                let router = &mut self.scratch.router_logits[..n_exp];
+                let max_r = router.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_r = 0.0f32;
+                for r in router.iter_mut() {
+                    *r = (*r - max_r).exp();
+                    sum_r += *r;
+                }
+                let inv_r = 1.0 / sum_r;
+                for r in router.iter_mut() {
+                    *r *= inv_r;
+                }
+
+                // Top-K selection: sort expert indices by probability descending
+                let mut expert_indices: Vec<usize> = (0..n_exp).collect();
+                expert_indices.sort_by(|&a, &b| {
+                    self.scratch.router_logits[b]
+                        .partial_cmp(&self.scratch.router_logits[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let selected = &expert_indices[..n_used];
+
+                // Renormalize selected expert weights
+                let selected_sum: f32 = selected
+                    .iter()
+                    .map(|&e| self.scratch.router_logits[e])
+                    .sum();
+                let inv_sel = 1.0 / selected_sum;
+
+                // Zero the FFN output accumulator
+                self.scratch.ffn_out.fill(0.0);
+
+                // Run each selected expert and accumulate weighted output
+                for &expert_idx in selected {
+                    let expert_weight = self.scratch.router_logits[expert_idx] * inv_sel;
+
+                    // Get expert weights (try individual naming first, then packed)
+                    let e = expert_idx as u32;
+                    let l = layer as u32;
+
+                    if let Some((gi, gd)) = self.weights.ffn_gate_expert(l, e) {
+                        let (ui, ud) = self.weights.ffn_up_expert(l, e)
+                            .ok_or_else(|| YuleError::Inference(
+                                format!("missing ffn_up expert {e} layer {l}")))?;
+                        let (di, dd) = self.weights.ffn_down_expert(l, e)
+                            .ok_or_else(|| YuleError::Inference(
+                                format!("missing ffn_down expert {e} layer {l}")))?;
+
+                        qmv(gi, gd, &self.scratch.normed, &mut self.scratch.gate[..ff])?;
+                        qmv(ui, ud, &self.scratch.normed, &mut self.scratch.up[..ff])?;
+
+                        // SwiGLU activation (Mixtral always uses SwiGLU)
+                        for i in 0..ff {
+                            let sigmoid = 1.0 / (1.0 + (-self.scratch.gate[i]).exp());
+                            self.scratch.gate[i] =
+                                self.scratch.gate[i] * sigmoid * self.scratch.up[i];
+                        }
+
+                        qmv(di, dd, &self.scratch.gate[..ff], &mut self.scratch.expert_out)?;
+                    } else if let Some((gi, gd)) = self.weights.ffn_gate_exps(l) {
+                        // Packed expert tensors: slice out this expert's rows
+                        let (ui, ud) = self.weights.ffn_up_exps(l)
+                            .ok_or_else(|| YuleError::Inference(
+                                format!("missing ffn_up_exps layer {l}")))?;
+                        let (di, dd) = self.weights.ffn_down_exps(l)
+                            .ok_or_else(|| YuleError::Inference(
+                                format!("missing ffn_down_exps layer {l}")))?;
+
+                        // For packed tensors, each expert has ff_dim rows.
+                        // Row data size = total_bytes / (n_experts * ff_dim) * ff_dim
+                        let gate_expert_bytes = gi.size_bytes as usize / n_exp;
+                        let up_expert_bytes = ui.size_bytes as usize / n_exp;
+                        let down_expert_bytes = di.size_bytes as usize / n_exp;
+                        let gate_off = expert_idx * gate_expert_bytes;
+                        let up_off = expert_idx * up_expert_bytes;
+                        let down_off = expert_idx * down_expert_bytes;
+
+                        // Build per-expert TensorInfo with correct shape.
+                        // GGUF shape is [cols, rows]. Packed gate/up: [dim, n_experts*ff_dim]
+                        // → per-expert: [dim, ff_dim]. Packed down: [ff_dim, n_experts*dim]
+                        // → per-expert: [ff_dim, dim].
+                        let mut ge_info = gi.clone();
+                        ge_info.shape = vec![gi.shape[0], ff as u64];
+                        ge_info.size_bytes = gate_expert_bytes as u64;
+                        let mut ue_info = ui.clone();
+                        ue_info.shape = vec![ui.shape[0], ff as u64];
+                        ue_info.size_bytes = up_expert_bytes as u64;
+                        let mut de_info = di.clone();
+                        de_info.shape = vec![ff as u64, dim as u64];
+                        de_info.size_bytes = down_expert_bytes as u64;
+
+                        qmv(&ge_info, &gd[gate_off..gate_off + gate_expert_bytes],
+                            &self.scratch.normed, &mut self.scratch.gate[..ff])?;
+                        qmv(&ue_info, &ud[up_off..up_off + up_expert_bytes],
+                            &self.scratch.normed, &mut self.scratch.up[..ff])?;
+
+                        for i in 0..ff {
+                            let sigmoid = 1.0 / (1.0 + (-self.scratch.gate[i]).exp());
+                            self.scratch.gate[i] =
+                                self.scratch.gate[i] * sigmoid * self.scratch.up[i];
+                        }
+
+                        qmv(&de_info, &dd[down_off..down_off + down_expert_bytes],
+                            &self.scratch.gate[..ff], &mut self.scratch.expert_out)?;
+                    } else {
+                        return Err(YuleError::Inference(format!(
+                            "no expert weights found for layer {l} expert {e}"
+                        )));
+                    }
+
+                    // Accumulate weighted expert output
+                    for i in 0..dim {
+                        self.scratch.ffn_out[i] += expert_weight * self.scratch.expert_out[i];
                     }
                 }
-                Activation::GeGLU => {
-                    for i in 0..ff {
-                        self.scratch.gate[i] = gelu(self.scratch.gate[i]) * self.scratch.up[i];
+            } else {
+                // Standard dense FFN
+                let (gi, gd) = self.weights.ffn_gate(layer as u32)?;
+                let (ui, ud) = self.weights.ffn_up(layer as u32)?;
+                qmv(gi, gd, &self.scratch.normed, &mut self.scratch.gate[..ff])?;
+                qmv(ui, ud, &self.scratch.normed, &mut self.scratch.up[..ff])?;
+
+                match self.cfg.activation {
+                    Activation::SwiGLU => {
+                        for i in 0..ff {
+                            let sigmoid = 1.0 / (1.0 + (-self.scratch.gate[i]).exp());
+                            self.scratch.gate[i] =
+                                self.scratch.gate[i] * sigmoid * self.scratch.up[i];
+                        }
+                    }
+                    Activation::GeGLU => {
+                        for i in 0..ff {
+                            self.scratch.gate[i] = gelu(self.scratch.gate[i]) * self.scratch.up[i];
+                        }
                     }
                 }
+
+                let (di, dd) = self.weights.ffn_down(layer as u32)?;
+                qmv(di, dd, &self.scratch.gate[..ff], &mut self.scratch.ffn_out)?;
             }
-
-            let (di, dd) = self.weights.ffn_down(layer as u32)?;
-            qmv(di, dd, &self.scratch.gate[..ff], &mut self.scratch.ffn_out)?;
 
             // post-FFN norm (Gemma2)
             if self.cfg.has_post_ffn_norm {
@@ -696,6 +846,53 @@ mod tests {
             assert!(l.abs() <= cap + 1e-6);
         }
         assert!((logits[2] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_moe_router_topk_selection() {
+        // Simulate router logits for 8 experts
+        let mut router_logits = vec![0.1, 0.05, 0.8, 0.02, 0.5, 0.03, 0.01, 0.3];
+        let n_exp = router_logits.len();
+        let n_used = 2;
+
+        // Softmax
+        let max_r = router_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_r = 0.0f32;
+        for r in router_logits.iter_mut() {
+            *r = (*r - max_r).exp();
+            sum_r += *r;
+        }
+        let inv_r = 1.0 / sum_r;
+        for r in router_logits.iter_mut() {
+            *r *= inv_r;
+        }
+
+        // Top-K selection
+        let mut expert_indices: Vec<usize> = (0..n_exp).collect();
+        expert_indices.sort_by(|&a, &b| {
+            router_logits[b]
+                .partial_cmp(&router_logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let selected = &expert_indices[..n_used];
+
+        // Expert 2 had highest raw logit (0.8), expert 4 had second (0.5)
+        assert_eq!(selected[0], 2);
+        assert_eq!(selected[1], 4);
+
+        // Renormalize selected weights
+        let selected_sum: f32 = selected.iter().map(|&e| router_logits[e]).sum();
+        let inv_sel = 1.0 / selected_sum;
+        let w0 = router_logits[selected[0]] * inv_sel;
+        let w1 = router_logits[selected[1]] * inv_sel;
+
+        // Weights should sum to 1.0
+        assert!((w0 + w1 - 1.0).abs() < 1e-6);
+        // Expert 2 should have higher weight than expert 4
+        assert!(w0 > w1);
+        // Both weights should be positive
+        assert!(w0 > 0.0);
+        assert!(w1 > 0.0);
     }
 
     #[test]
