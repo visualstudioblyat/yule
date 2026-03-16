@@ -360,6 +360,85 @@ impl ComputeBackend for CpuBackend {
         Ok(())
     }
 
+    fn attn_score(
+        &self,
+        q: &BufferHandle,
+        k_cache: &BufferHandle,
+        scores: &BufferHandle,
+        head_dim: u32,
+        seq_len: u32,
+        head_offset: u32,
+        kv_offset: u32,
+        kv_stride: u32,
+    ) -> Result<()> {
+        let mut buffers = self.buffers.lock().unwrap();
+        let q_data = Self::get_buf(&buffers, q)?.as_ptr();
+        let q_len = Self::get_buf(&buffers, q)?.len();
+        let k_data = Self::get_buf(&buffers, k_cache)?.as_ptr();
+        let k_len = Self::get_buf(&buffers, k_cache)?.len();
+        let scores_buf = Self::get_buf_mut(&mut buffers, scores)?;
+        let scores_f32 = as_f32_slice_mut(scores_buf);
+
+        let q_f32: &[f32] =
+            bytemuck::cast_slice(unsafe { std::slice::from_raw_parts(q_data, q_len) });
+        let k_f32: &[f32] =
+            bytemuck::cast_slice(unsafe { std::slice::from_raw_parts(k_data, k_len) });
+
+        let hd = head_dim as usize;
+        let ho = head_offset as usize;
+        let kvo = kv_offset as usize;
+        let kvs = kv_stride as usize;
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        for t in 0..seq_len as usize {
+            let mut dot = 0.0f32;
+            for d in 0..hd {
+                dot += q_f32[ho + d] * k_f32[t * kvs + kvo + d];
+            }
+            scores_f32[t] = dot * scale;
+        }
+        Ok(())
+    }
+
+    fn attn_value(
+        &self,
+        weights: &BufferHandle,
+        v_cache: &BufferHandle,
+        output: &BufferHandle,
+        head_dim: u32,
+        seq_len: u32,
+        kv_offset: u32,
+        kv_stride: u32,
+        out_offset: u32,
+    ) -> Result<()> {
+        let mut buffers = self.buffers.lock().unwrap();
+        let w_data = Self::get_buf(&buffers, weights)?.as_ptr();
+        let w_len = Self::get_buf(&buffers, weights)?.len();
+        let v_data = Self::get_buf(&buffers, v_cache)?.as_ptr();
+        let v_len = Self::get_buf(&buffers, v_cache)?.len();
+        let out_buf = Self::get_buf_mut(&mut buffers, output)?;
+        let out_f32 = as_f32_slice_mut(out_buf);
+
+        let w_f32: &[f32] =
+            bytemuck::cast_slice(unsafe { std::slice::from_raw_parts(w_data, w_len) });
+        let v_f32: &[f32] =
+            bytemuck::cast_slice(unsafe { std::slice::from_raw_parts(v_data, v_len) });
+
+        let hd = head_dim as usize;
+        let kvo = kv_offset as usize;
+        let kvs = kv_stride as usize;
+        let oo = out_offset as usize;
+
+        for d in 0..hd {
+            let mut sum = 0.0f32;
+            for t in 0..seq_len as usize {
+                sum += w_f32[t] * v_f32[t * kvs + kvo + d];
+            }
+            out_f32[oo + d] = sum;
+        }
+        Ok(())
+    }
+
     fn synchronize(&self) -> Result<()> {
         Ok(()) // CPU is synchronous
     }
@@ -625,6 +704,52 @@ mod tests {
         assert!((cache[pos * kv_stride + kv_stride - 1] - kv_stride as f32).abs() < 1e-5);
         // Position 3 should be zeros
         assert!((cache[3 * kv_stride] - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_attn_score_value_ops() {
+        let b = CpuBackend::new();
+        let hd = 2;
+        let seq_len = 3;
+
+        let q = b.allocate(4 * hd * 4).unwrap(); // 4 heads * 2 dims
+        let k_cache = b.allocate(seq_len * 2 * hd * 4).unwrap(); // 2 kv heads
+        let v_cache = b.allocate(seq_len * 2 * hd * 4).unwrap();
+        let scores = b.allocate(seq_len * 4).unwrap();
+        let out = b.allocate(4 * hd * 4).unwrap();
+
+        write_f32(&b, &q, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5]);
+        write_f32(
+            &b,
+            &k_cache,
+            &[1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.5, 0.5],
+        );
+        write_f32(
+            &b,
+            &v_cache,
+            &[
+                10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0,
+            ],
+        );
+
+        // Test attn_score: head 0 (offset 0), kv head 0 (offset 0), kv_stride = 4
+        b.attn_score(&q, &k_cache, &scores, 2, 3, 0, 0, 4).unwrap();
+        let s = read_f32(&b, &scores, 3);
+        let scale = 1.0 / (2.0f32).sqrt();
+        assert!((s[0] - 1.0 * scale).abs() < 1e-5); // Q=[1,0] . K=[1,0] = 1
+        assert!((s[1] - 0.0).abs() < 1e-5); // Q=[1,0] . K=[0,1] = 0
+        assert!((s[2] - 1.0 * scale).abs() < 1e-5); // Q=[1,0] . K=[1,1] = 1
+
+        // Softmax the scores
+        b.softmax(&scores, &scores, 3).unwrap();
+
+        // Test attn_value: use softmax weights
+        b.attn_value(&scores, &v_cache, &out, 2, 3, 0, 4, 0)
+            .unwrap();
+        let result = read_f32(&b, &out, 2);
+        // Weighted sum of V values should be valid floats
+        assert!(result[0].is_finite());
+        assert!(result[1].is_finite());
     }
 
     #[test]

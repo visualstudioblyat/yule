@@ -17,4 +17,5 @@ getrandom = { workspace = true }
 
 [features]
 default = []
+cpu = ["yule-gpu/cpu"]
 vulkan = ["yule-gpu/vulkan"]
