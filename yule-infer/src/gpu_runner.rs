@@ -460,68 +460,105 @@ impl<'a> GpuTransformerRunner<'a> {
 
             // Attention — per-head GQA dispatch
             let kv_group = n_heads / n_kv_heads;
-            for h in 0..n_heads {
-                let kv_h = h / kv_group;
-                let head_offset = (h * hd) as u32;
-                let kv_off = (kv_h * hd) as u32;
+            let use_flash_decode = seq_len >= 256;
 
-                // attn_score: Q · K_cache → scores
-                {
-                    let push = [hd as u32, seq_len, head_offset, kv_off, kv_stride as u32];
-                    let push_bytes: &[u8] = bytemuck::cast_slice(&push);
-                    self.backend.dispatch_batched(
-                        cmd,
-                        ShaderKey::AttnScore,
-                        &[
-                            &self.scratch.q,
-                            &self.k_cache[layer],
-                            &self.scratch.scores,
-                            &self.scratch.scores,
-                        ],
-                        push_bytes,
-                        seq_len,
-                        1,
-                        1,
-                    )?;
-                }
-                self.backend.barrier(cmd);
+            if use_flash_decode {
+                // Flash-Decoding: split-KV attention for long sequences
+                tracing::debug!(
+                    layer,
+                    seq_len,
+                    "using flash-decode attention (seq_len >= 256)"
+                );
+                for h in 0..n_heads {
+                    let kv_h = h / kv_group;
+                    let head_offset = (h * hd) as u32;
+                    let kv_off = (kv_h * hd) as u32;
 
-                // softmax(scores) in-place
-                {
-                    let push = [seq_len];
-                    let push_bytes: &[u8] = bytemuck::cast_slice(&push);
-                    self.backend.dispatch_batched(
+                    self.backend.flash_decode(
                         cmd,
-                        ShaderKey::Softmax,
-                        &[&self.scratch.scores, &self.scratch.scores],
-                        push_bytes,
-                        1,
-                        1,
-                        1,
-                    )?;
-                }
-                self.backend.barrier(cmd);
-
-                // attn_value: scores × V_cache → attn_out[head_offset..]
-                {
-                    let push = [hd as u32, seq_len, kv_off, kv_stride as u32, head_offset];
-                    let push_bytes: &[u8] = bytemuck::cast_slice(&push);
-                    self.backend.dispatch_batched(
-                        cmd,
-                        ShaderKey::AttnValue,
-                        &[
-                            &self.scratch.scores,
-                            &self.v_cache[layer],
-                            &self.scratch.attn_out,
-                            &self.scratch.attn_out,
-                        ],
-                        push_bytes,
+                        &self.scratch.q,
+                        &self.k_cache[layer],
+                        &self.v_cache[layer],
+                        &self.scratch.attn_out,
                         hd as u32,
-                        1,
-                        1,
+                        seq_len,
+                        head_offset,
+                        kv_off,
+                        kv_stride as u32,
+                        head_offset, // out_offset = head_offset
                     )?;
+                    self.backend.barrier(cmd);
                 }
-                self.backend.barrier(cmd);
+            } else {
+                // Standard per-head attention for short sequences
+                tracing::debug!(
+                    layer,
+                    seq_len,
+                    "using standard per-head attention (seq_len < 256)"
+                );
+                for h in 0..n_heads {
+                    let kv_h = h / kv_group;
+                    let head_offset = (h * hd) as u32;
+                    let kv_off = (kv_h * hd) as u32;
+
+                    // attn_score: Q · K_cache → scores
+                    {
+                        let push = [hd as u32, seq_len, head_offset, kv_off, kv_stride as u32];
+                        let push_bytes: &[u8] = bytemuck::cast_slice(&push);
+                        self.backend.dispatch_batched(
+                            cmd,
+                            ShaderKey::AttnScore,
+                            &[
+                                &self.scratch.q,
+                                &self.k_cache[layer],
+                                &self.scratch.scores,
+                                &self.scratch.scores,
+                            ],
+                            push_bytes,
+                            seq_len,
+                            1,
+                            1,
+                        )?;
+                    }
+                    self.backend.barrier(cmd);
+
+                    // softmax(scores) in-place
+                    {
+                        let push = [seq_len];
+                        let push_bytes: &[u8] = bytemuck::cast_slice(&push);
+                        self.backend.dispatch_batched(
+                            cmd,
+                            ShaderKey::Softmax,
+                            &[&self.scratch.scores, &self.scratch.scores],
+                            push_bytes,
+                            1,
+                            1,
+                            1,
+                        )?;
+                    }
+                    self.backend.barrier(cmd);
+
+                    // attn_value: scores × V_cache → attn_out[head_offset..]
+                    {
+                        let push = [hd as u32, seq_len, kv_off, kv_stride as u32, head_offset];
+                        let push_bytes: &[u8] = bytemuck::cast_slice(&push);
+                        self.backend.dispatch_batched(
+                            cmd,
+                            ShaderKey::AttnValue,
+                            &[
+                                &self.scratch.scores,
+                                &self.v_cache[layer],
+                                &self.scratch.attn_out,
+                                &self.scratch.attn_out,
+                            ],
+                            push_bytes,
+                            hd as u32,
+                            1,
+                            1,
+                        )?;
+                    }
+                    self.backend.barrier(cmd);
+                }
             }
 
             // Output projection: attn_out → attn_proj
