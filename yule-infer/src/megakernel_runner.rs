@@ -259,10 +259,16 @@ impl<'a> MegakernelRunner<'a> {
         let offset_bytes: &[u8] = bytemuck::cast_slice(&offsets);
         backend.copy_to_device(offset_bytes, &offset_buf)?;
 
+        // Debug: print output weight offset
+        let output_weight_idx = cfg.n_layers * 9 + 1;
+        let output_norm_idx = cfg.n_layers * 9;
         tracing::info!(
-            "megakernel: packed {} MB weights, {} offset entries",
+            "megakernel: packed {} MB weights, {} offset entries. output_norm_offset={}, output_weight_offset={} (uint), byte={}",
             total_bytes / (1024 * 1024),
-            offsets.len()
+            offsets.len(),
+            offsets[output_norm_idx],
+            offsets[output_weight_idx],
+            offsets[output_weight_idx] as u64 * 4
         );
 
         Ok((packed, offset_buf))
