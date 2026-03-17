@@ -172,6 +172,77 @@ impl VulkanBackend {
     pub fn submit_batch(&self, cmd: vk::CommandBuffer) -> Result<()> {
         self.commands.submit_and_wait(cmd)
     }
+
+    /// Flash-Decoding: split KV cache across multiple workgroups for parallel decode.
+    /// Falls back early (returns Ok(())) if seq_len < split_threshold, in which case
+    /// the caller should use the existing per-head attention path.
+    pub fn flash_decode(
+        &self,
+        cmd: vk::CommandBuffer,
+        q: &BufferHandle,
+        k_cache: &BufferHandle,
+        v_cache: &BufferHandle,
+        output: &BufferHandle,
+        head_dim: u32,
+        seq_len: u32,
+        head_offset: u32,
+        kv_offset: u32,
+        kv_stride: u32,
+        out_offset: u32,
+    ) -> Result<()> {
+        let split_threshold = 256; // only use flash-decode for long sequences
+
+        if seq_len < split_threshold {
+            // Fall back to standard attn_score + softmax + attn_value
+            return Ok(()); // caller should use the existing per-head attention path
+        }
+
+        let num_splits = ((seq_len + 255) / 256).min(16); // max 16 splits
+        let split_size = (seq_len + num_splits - 1) / num_splits;
+
+        // Allocate temporary buffers for partial results
+        let partial_out = self.allocate((num_splits as usize * head_dim as usize) * 4)?;
+        let partial_lse = self.allocate(num_splits as usize * 4)?;
+        let partial_max = self.allocate(num_splits as usize * 4)?;
+
+        // Phase 1: Split attention — one workgroup per split
+        for s in 0..num_splits {
+            let split_start = s * split_size;
+            let split_end = ((s + 1) * split_size).min(seq_len);
+
+            let push = [head_dim, split_start, split_end, head_offset, kv_offset, kv_stride, s];
+            let push_bytes: &[u8] = bytemuck::cast_slice(&push);
+
+            self.dispatch_batched(
+                cmd,
+                ShaderKey::FlashDecodeSplit,
+                &[q, k_cache, v_cache, &partial_out, &partial_lse, &partial_max],
+                push_bytes,
+                1, 1, 1, // single workgroup per split (256 threads handle the split internally)
+            )?;
+        }
+
+        self.barrier(cmd);
+
+        // Phase 2: Reduce — combine partial results
+        let reduce_push = [head_dim, num_splits, out_offset];
+        let reduce_bytes: &[u8] = bytemuck::cast_slice(&reduce_push);
+
+        self.dispatch_batched(
+            cmd,
+            ShaderKey::FlashDecodeReduce,
+            &[&partial_out, &partial_lse, &partial_max, output],
+            reduce_bytes,
+            1, 1, 1,
+        )?;
+
+        // Free temporary buffers
+        self.free(partial_out)?;
+        self.free(partial_lse)?;
+        self.free(partial_max)?;
+
+        Ok(())
+    }
 }
 
 impl ComputeBackend for VulkanBackend {

@@ -17,6 +17,9 @@ pub enum ShaderKey {
     QmvQ4K,
     QmvQ6K,
     QmvQ8_0,
+    // Flash-Decoding split-KV dispatch
+    FlashDecodeSplit,
+    FlashDecodeReduce,
     // Cooperative matrix variants (VK_KHR_cooperative_matrix)
     CoopMatmul,
     CoopQmvQ4_0,
@@ -273,6 +276,19 @@ impl PipelineManager {
                 include_bytes!("../../shaders/compiled/qmv_q8_0.spv"),
                 3,
                 12,
+            ),
+            // Flash-Decoding: split KV cache across workgroups for parallel decode
+            (
+                ShaderKey::FlashDecodeSplit,
+                include_bytes!("../../shaders/compiled/flash_decode_split.spv"),
+                6,  // query, key_cache, value_cache, partial_out, partial_lse, partial_max
+                28, // head_dim(4) + split_start(4) + split_end(4) + head_offset(4) + kv_offset(4) + kv_stride(4) + split_idx(4)
+            ),
+            (
+                ShaderKey::FlashDecodeReduce,
+                include_bytes!("../../shaders/compiled/flash_decode_reduce.spv"),
+                4,  // partial_out, partial_lse, partial_max, final_out
+                12, // head_dim(4) + num_splits(4) + out_offset(4)
             ),
         ];
 
