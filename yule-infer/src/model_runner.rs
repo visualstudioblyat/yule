@@ -1,4 +1,5 @@
 #![allow(clippy::needless_range_loop)]
+use crate::kv_cache::StreamingKvCache;
 use crate::weight_loader::TransformerWeights;
 use yule_core::dequant;
 use yule_core::dtype::DType;
@@ -43,6 +44,7 @@ struct RunnerConfig {
     norm_weight_offset: f32,
     n_experts: u32,
     n_experts_used: u32,
+    streaming_mode: bool,
 }
 
 struct ScratchBuffers {
@@ -307,12 +309,61 @@ fn gelu(x: f32) -> f32 {
     x * 0.5 * (1.0 + (0.797_884_6 * (x + 0.044715 * x * x * x)).tanh())
 }
 
+/// Tracks per-layer attention entropy for adaptive KV cache budget allocation.
+///
+/// During inference, attention entropy is recorded per layer using an exponential
+/// moving average. Layers with higher entropy (more diffuse attention) benefit from
+/// larger cache budgets, while layers with lower entropy (sharper attention) can
+/// operate with smaller windows.
+struct LayerEntropyTracker {
+    per_layer_entropy: Vec<f64>,
+    sample_count: u32,
+}
+
+impl LayerEntropyTracker {
+    fn new(n_layers: usize) -> Self {
+        Self {
+            per_layer_entropy: vec![0.0; n_layers],
+            sample_count: 0,
+        }
+    }
+
+    /// Record attention entropy for a layer (computed from softmax scores).
+    fn record(&mut self, layer: usize, scores: &[f32]) {
+        let entropy = -scores
+            .iter()
+            .filter(|&&s| s > 1e-10)
+            .map(|&s| (s as f64) * (s as f64).log2())
+            .sum::<f64>();
+        // Exponential moving average
+        let alpha = 0.1;
+        self.per_layer_entropy[layer] =
+            (1.0 - alpha) * self.per_layer_entropy[layer] + alpha * entropy;
+        self.sample_count += 1;
+    }
+
+    /// Get relative budget for each layer (higher entropy = more cache needed).
+    /// Returns a ratio per layer normalized so the average ratio is 1.0.
+    fn budget_ratios(&self) -> Vec<f64> {
+        let total: f64 = self.per_layer_entropy.iter().sum();
+        if total <= 0.0 {
+            return vec![1.0; self.per_layer_entropy.len()];
+        }
+        self.per_layer_entropy
+            .iter()
+            .map(|e| e / total * self.per_layer_entropy.len() as f64)
+            .collect()
+    }
+}
+
 pub struct TransformerRunner<'a> {
     cfg: RunnerConfig,
     arch: Architecture,
     weights: TransformerWeights<'a>,
     k_cache: Vec<Vec<f32>>,
     v_cache: Vec<Vec<f32>>,
+    streaming_cache: Option<StreamingKvCache>,
+    entropy_tracker: LayerEntropyTracker,
     pos: usize,
     hidden: Vec<f32>,
     residual: Vec<f32>,
@@ -401,6 +452,21 @@ impl<'a> TransformerRunner<'a> {
             norm_weight_offset: if is_gemma { 1.0 } else { 0.0 },
             n_experts,
             n_experts_used,
+            streaming_mode: max_seq_len >= 8192,
+        };
+
+        let streaming_cache = if cfg.streaming_mode {
+            let window_size = (max_seq_len / 2) as u32;
+            let num_sink_tokens = 4u32;
+            Some(StreamingKvCache::new(
+                n_layers as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                num_sink_tokens,
+                window_size,
+            ))
+        } else {
+            None
         };
 
         let kv_len = max_seq_len * n_kv_heads * head_dim;
@@ -426,12 +492,16 @@ impl<'a> TransformerRunner<'a> {
 
         let rope = RopeTable::new(max_seq_len, rotary_dim, cfg.rope_freq_base);
 
+        let entropy_tracker = LayerEntropyTracker::new(n_layers);
+
         Ok(Self {
             cfg,
             arch,
             weights,
             k_cache,
             v_cache,
+            streaming_cache,
+            entropy_tracker,
             pos: 0,
             hidden: vec![0.0; dim],
             residual: vec![0.0; dim],
@@ -532,13 +602,27 @@ impl<'a> TransformerRunner<'a> {
             apply_rope(&mut self.scratch.k, pos, hd, &self.rope);
 
             // write KV to cache
-            let cache_off = pos * kv_stride;
-            self.k_cache[layer][cache_off..cache_off + kv_stride]
-                .copy_from_slice(&self.scratch.k[..kv_stride]);
-            self.v_cache[layer][cache_off..cache_off + kv_stride]
-                .copy_from_slice(&self.scratch.v[..kv_stride]);
+            if let Some(ref mut sc) = self.streaming_cache {
+                sc.write_kv(
+                    layer as u32,
+                    &self.scratch.k[..kv_stride],
+                    &self.scratch.v[..kv_stride],
+                );
+            } else {
+                let cache_off = pos * kv_stride;
+                self.k_cache[layer][cache_off..cache_off + kv_stride]
+                    .copy_from_slice(&self.scratch.k[..kv_stride]);
+                self.v_cache[layer][cache_off..cache_off + kv_stride]
+                    .copy_from_slice(&self.scratch.v[..kv_stride]);
+            }
 
             // attention
+            let attn_seq_len = if self.streaming_cache.is_some() {
+                self.streaming_cache.as_ref().unwrap().effective_len() as usize
+            } else {
+                seq_len
+            };
+
             self.scratch.attn_out.fill(0.0);
             let scale = 1.0 / (hd as f32).sqrt();
 
@@ -546,21 +630,32 @@ impl<'a> TransformerRunner<'a> {
                 let kv_h = h / kv_group_size;
                 let q_head = &self.scratch.q[h * hd..(h + 1) * hd];
 
-                let scores = &mut self.scratch.scores[..seq_len];
-                for t in 0..seq_len {
-                    // sliding window masking
-                    if let Some(w) = self.cfg.sliding_window {
-                        if pos >= w && t < pos - w {
-                            scores[t] = f32::NEG_INFINITY;
-                            continue;
+                let scores = &mut self.scratch.scores[..attn_seq_len];
+                for t in 0..attn_seq_len {
+                    // sliding window masking (only for inline cache mode)
+                    if self.streaming_cache.is_none() {
+                        if let Some(w) = self.cfg.sliding_window {
+                            if pos >= w && t < pos - w {
+                                scores[t] = f32::NEG_INFINITY;
+                                continue;
+                            }
                         }
                     }
 
-                    let k_offset = t * kv_stride + kv_h * hd;
-                    let k_head = &self.k_cache[layer][k_offset..k_offset + hd];
                     let mut dot = 0.0f32;
-                    for d in 0..hd {
-                        dot += q_head[d] * k_head[d];
+                    if let Some(ref sc) = self.streaming_cache {
+                        let k_data = sc.read_k(layer as u32);
+                        let k_offset = t * kv_stride + kv_h * hd;
+                        let k_head = &k_data[k_offset..k_offset + hd];
+                        for d in 0..hd {
+                            dot += q_head[d] * k_head[d];
+                        }
+                    } else {
+                        let k_offset = t * kv_stride + kv_h * hd;
+                        let k_head = &self.k_cache[layer][k_offset..k_offset + hd];
+                        for d in 0..hd {
+                            dot += q_head[d] * k_head[d];
+                        }
                     }
                     scores[t] = dot * scale;
                 }
@@ -584,13 +679,27 @@ impl<'a> TransformerRunner<'a> {
                     *s *= inv;
                 }
 
+                // Record entropy for adaptive budget tracking (once per head 0)
+                if h == 0 {
+                    self.entropy_tracker.record(layer, scores);
+                }
+
                 let out_head = &mut self.scratch.attn_out[h * hd..(h + 1) * hd];
-                for t in 0..seq_len {
-                    let v_offset = t * kv_stride + kv_h * hd;
-                    let v_head = &self.v_cache[layer][v_offset..v_offset + hd];
+                for t in 0..attn_seq_len {
                     let w = scores[t];
-                    for d in 0..hd {
-                        out_head[d] += w * v_head[d];
+                    if let Some(ref sc) = self.streaming_cache {
+                        let v_data = sc.read_v(layer as u32);
+                        let v_offset = t * kv_stride + kv_h * hd;
+                        let v_head = &v_data[v_offset..v_offset + hd];
+                        for d in 0..hd {
+                            out_head[d] += w * v_head[d];
+                        }
+                    } else {
+                        let v_offset = t * kv_stride + kv_h * hd;
+                        let v_head = &self.v_cache[layer][v_offset..v_offset + hd];
+                        for d in 0..hd {
+                            out_head[d] += w * v_head[d];
+                        }
                     }
                 }
             }
@@ -860,6 +969,28 @@ impl<'a> TransformerRunner<'a> {
         self.pos += 1;
         Ok(self.scratch.logits.clone())
     }
+
+    /// Returns per-layer entropy budget ratios after sufficient warmup samples.
+    ///
+    /// Each ratio indicates how much relative cache budget a layer needs:
+    /// values > 1.0 mean the layer has above-average entropy (diffuse attention)
+    /// and benefits from a larger cache window, while values < 1.0 indicate
+    /// sharper attention patterns that can operate with less cache.
+    ///
+    /// Returns `None` if fewer than `n_layers` samples have been recorded
+    /// (i.e., not enough warmup tokens have been processed).
+    pub fn layer_entropy_profile(&self) -> Option<Vec<f64>> {
+        let min_samples = self.cfg.n_layers as u32;
+        if self.entropy_tracker.sample_count < min_samples {
+            return None;
+        }
+        Some(self.entropy_tracker.budget_ratios())
+    }
+
+    /// Returns whether this runner is using streaming KV cache mode.
+    pub fn is_streaming_mode(&self) -> bool {
+        self.streaming_cache.is_some()
+    }
 }
 
 impl<'a> ModelRunner for TransformerRunner<'a> {
@@ -881,6 +1012,9 @@ impl<'a> ModelRunner for TransformerRunner<'a> {
 
     fn reset(&mut self) {
         self.pos = 0;
+        if let Some(ref mut sc) = self.streaming_cache {
+            sc.clear();
+        }
     }
 }
 

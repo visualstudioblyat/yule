@@ -5,11 +5,14 @@ pub mod constant_time;
 pub mod gpu_runner;
 pub mod kv_cache;
 pub mod mamba;
+pub mod mixture_of_depths;
 pub mod model_runner;
+pub mod prefix_cache;
 pub mod rwkv;
 pub mod sampler;
 pub mod speculative;
 pub mod thread_pool;
+pub mod token_merge;
 pub mod verified_kv;
 pub mod weight_loader;
 
