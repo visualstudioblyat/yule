@@ -35,13 +35,32 @@ fn qmv(weight_info: &TensorInfo, weight_data: &[u8], input: &[f32], out: &mut [f
     let n_cols = input.len();
     let blocks_per_row = n_cols / block_size;
 
-    for row in 0..n_rows {
+    // Compute actual number of rows from data size to handle shape mismatches
+    let total_blocks = if block_bytes > 0 {
+        weight_data.len() / block_bytes
+    } else {
+        0
+    };
+    let actual_rows = if blocks_per_row > 0 {
+        total_blocks / blocks_per_row
+    } else {
+        0
+    };
+    let safe_rows = n_rows.min(actual_rows);
+
+    for row in 0..safe_rows {
         let mut sum = 0.0f32;
         let row_offset = row * blocks_per_row * block_bytes;
         for b in 0..blocks_per_row {
             let block_start = row_offset + b * block_bytes;
+            if block_start + block_bytes > weight_data.len() {
+                break;
+            }
             let block = &weight_data[block_start..block_start + block_bytes];
             let act_start = b * block_size;
+            if act_start + block_size > input.len() {
+                break;
+            }
             let act = &input[act_start..act_start + block_size];
             sum += dequant::vec_dot_block(dtype, block, act).unwrap_or_else(|_| {
                 let mut tmp = vec![0.0f32; block_size];
@@ -50,6 +69,10 @@ fn qmv(weight_info: &TensorInfo, weight_data: &[u8], input: &[f32], out: &mut [f
             });
         }
         out[row] = sum;
+    }
+    // Zero remaining rows if actual data was shorter than expected
+    for row in safe_rows..n_rows {
+        out[row] = 0.0;
     }
     Ok(())
 }
@@ -60,8 +83,10 @@ fn dequant_tensor(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
     let n_elements = info.num_elements() as usize;
 
     if dtype == DType::F32 {
+        let available = data.len() / 4;
+        let count = n_elements.min(available);
         let mut out = vec![0.0f32; n_elements];
-        for i in 0..n_elements {
+        for i in 0..count {
             out[i] = f32::from_le_bytes([
                 data[i * 4],
                 data[i * 4 + 1],
@@ -73,8 +98,10 @@ fn dequant_tensor(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
     }
 
     if dtype == DType::F16 {
+        let available = data.len() / 2;
+        let count = n_elements.min(available);
         let mut out = vec![0.0f32; n_elements];
-        for i in 0..n_elements {
+        for i in 0..count {
             let bits = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
             out[i] = dequant::f16_to_f32(bits);
         }
@@ -84,27 +111,46 @@ fn dequant_tensor(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
     // Quantized format: dequantize block by block
     let block_size = dtype.block_size();
     let block_bytes = dtype.size_of_block();
+    if block_bytes == 0 {
+        return vec![0.0f32; n_elements];
+    }
     let n_blocks = data.len() / block_bytes;
+    if n_blocks == 0 {
+        return vec![0.0f32; n_elements];
+    }
     let mut out = vec![0.0f32; n_blocks * block_size];
     for b in 0..n_blocks {
         let block = &data[b * block_bytes..(b + 1) * block_bytes];
         let _ =
             dequant::dequant_block(dtype, block, &mut out[b * block_size..(b + 1) * block_size]);
     }
+    // Truncate to requested element count (quantized blocks may produce padding)
+    out.truncate(n_elements);
     out
 }
 
 /// Read a single f32 value from a tensor at a given element index, handling any dtype.
+/// Returns 0.0 if the index is out of bounds for the underlying data.
 fn read_weight_f32(info: &TensorInfo, data: &[u8], index: usize) -> f32 {
     match info.dtype {
-        DType::F32 => f32::from_le_bytes([
-            data[index * 4],
-            data[index * 4 + 1],
-            data[index * 4 + 2],
-            data[index * 4 + 3],
-        ]),
+        DType::F32 => {
+            let byte_idx = index * 4;
+            if byte_idx + 4 > data.len() {
+                return 0.0;
+            }
+            f32::from_le_bytes([
+                data[byte_idx],
+                data[byte_idx + 1],
+                data[byte_idx + 2],
+                data[byte_idx + 3],
+            ])
+        }
         DType::F16 => {
-            let bits = u16::from_le_bytes([data[index * 2], data[index * 2 + 1]]);
+            let byte_idx = index * 2;
+            if byte_idx + 2 > data.len() {
+                return 0.0;
+            }
+            let bits = u16::from_le_bytes([data[byte_idx], data[byte_idx + 1]]);
             dequant::f16_to_f32(bits)
         }
         _ => {
@@ -112,11 +158,14 @@ fn read_weight_f32(info: &TensorInfo, data: &[u8], index: usize) -> f32 {
             let bs = info.dtype.block_size();
             let bb = info.dtype.size_of_block();
             let block_idx = index / bs;
-            let elem_idx = index % bs;
-            let block = &data[block_idx * bb..(block_idx + 1) * bb];
+            let byte_start = block_idx * bb;
+            if byte_start + bb > data.len() {
+                return 0.0;
+            }
+            let block = &data[byte_start..byte_start + bb];
             let mut tmp = vec![0.0f32; bs];
             let _ = dequant::dequant_block(info.dtype, block, &mut tmp);
-            tmp[elem_idx]
+            tmp[index % bs]
         }
     }
 }
@@ -172,6 +221,14 @@ pub struct MambaRunner<'a> {
     layer_states: Vec<MambaLayerState>,
     hidden: Vec<f32>,
     scratch: MambaScratch,
+    // Pre-dequantized small per-layer tensors (avoids repeated quantized reads
+    // and prevents index-out-of-bounds when small tensors have a different dtype
+    // than the main weight matrices in quantized GGUF files).
+    conv_weights: Vec<Vec<f32>>,           // [n_layers][d_inner * d_conv]
+    conv_biases: Vec<Option<Vec<f32>>>,    // [n_layers][d_inner] or None
+    a_logs: Vec<Vec<f32>>,                 // [n_layers][d_inner * d_state]
+    d_params: Vec<Option<Vec<f32>>>,       // [n_layers][d_inner] or None
+    dt_proj_biases: Vec<Option<Vec<f32>>>, // [n_layers][d_inner] or None
 }
 
 struct MambaWeights<'a> {
@@ -196,24 +253,8 @@ impl<'a> MambaWeights<'a> {
     fn in_proj(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
         self.store.require(&format!("blk.{layer}.ssm_in.weight"))
     }
-    fn conv1d_weight(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store
-            .require(&format!("blk.{layer}.ssm_conv1d.weight"))
-    }
-    fn conv1d_bias(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
-        self.store.get(&format!("blk.{layer}.ssm_conv1d.bias"))
-    }
     fn dt_proj_weight(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
         self.store.require(&format!("blk.{layer}.ssm_dt.weight"))
-    }
-    fn dt_proj_bias(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
-        self.store.get(&format!("blk.{layer}.ssm_dt.bias"))
-    }
-    fn a_log(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.ssm_a"))
-    }
-    fn d(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
-        self.store.get(&format!("blk.{layer}.ssm_d"))
     }
     fn out_proj(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
         self.store.require(&format!("blk.{layer}.ssm_out.weight"))
@@ -284,6 +325,54 @@ impl<'a> MambaRunner<'a> {
             });
         }
 
+        // Pre-dequantize small per-layer tensors. These don't change between
+        // tokens and may have a different dtype than the main weight matrices
+        // in quantized GGUF files (e.g. F32 while the model is Q4_K_M).
+        let mut conv_weights = Vec::with_capacity(n_layers);
+        let mut conv_biases = Vec::with_capacity(n_layers);
+        let mut a_logs = Vec::with_capacity(n_layers);
+        let mut d_params = Vec::with_capacity(n_layers);
+        let mut dt_proj_biases = Vec::with_capacity(n_layers);
+
+        for layer in 0..n_layers {
+            let l = layer as u32;
+
+            // conv1d weight
+            if let Some((info, data)) = store.get(&format!("blk.{l}.ssm_conv1d.weight")) {
+                conv_weights.push(dequant_tensor(info, data));
+            } else {
+                conv_weights.push(vec![0.0; d_inner * d_conv]);
+            }
+
+            // conv1d bias (optional)
+            conv_biases.push(
+                store
+                    .get(&format!("blk.{l}.ssm_conv1d.bias"))
+                    .map(|(info, data)| dequant_tensor(info, data)),
+            );
+
+            // A_log
+            if let Some((info, data)) = store.get(&format!("blk.{l}.ssm_a")) {
+                a_logs.push(dequant_tensor(info, data));
+            } else {
+                a_logs.push(vec![0.0; d_inner * d_state]);
+            }
+
+            // D (optional)
+            d_params.push(
+                store
+                    .get(&format!("blk.{l}.ssm_d"))
+                    .map(|(info, data)| dequant_tensor(info, data)),
+            );
+
+            // dt_proj bias (optional)
+            dt_proj_biases.push(
+                store
+                    .get(&format!("blk.{l}.ssm_dt.bias"))
+                    .map(|(info, data)| dequant_tensor(info, data)),
+            );
+        }
+
         let scratch = MambaScratch {
             normed: vec![0.0; dim],
             xz: vec![0.0; 2 * d_inner],
@@ -305,6 +394,11 @@ impl<'a> MambaRunner<'a> {
             layer_states,
             hidden: vec![0.0; dim],
             scratch,
+            conv_weights,
+            conv_biases,
+            a_logs,
+            d_params,
+            dt_proj_biases,
         })
     }
 
@@ -372,21 +466,28 @@ impl<'a> MambaRunner<'a> {
             }
 
             // Conv1D output: for each d_inner channel, dot product with conv kernel
-            let (conv_info, conv_data) = self.weights.conv1d_weight(layer as u32)?;
+            // Uses pre-dequantized weights to avoid dtype mismatch crashes on quantized models
+            let conv_w = &self.conv_weights[layer];
             for i in 0..d_inner {
                 let mut sum = 0.0f32;
                 for k in 0..d_conv {
                     let w_idx = i * d_conv + k;
-                    let w = read_weight_f32(conv_info, conv_data, w_idx);
+                    let w = if w_idx < conv_w.len() {
+                        conv_w[w_idx]
+                    } else {
+                        0.0
+                    };
                     sum += state.conv_state[i * d_conv + k] * w;
                 }
                 self.scratch.x_conv[i] = sum;
             }
 
             // Add conv bias if present
-            if let Some((bias_info, bias_data)) = self.weights.conv1d_bias(layer as u32) {
+            if let Some(ref bias) = self.conv_biases[layer] {
                 for i in 0..d_inner {
-                    self.scratch.x_conv[i] += read_weight_f32(bias_info, bias_data, i);
+                    if i < bias.len() {
+                        self.scratch.x_conv[i] += bias[i];
+                    }
                 }
             }
 
@@ -419,9 +520,11 @@ impl<'a> MambaRunner<'a> {
                 &self.scratch.dt_proj[..self.cfg.dt_rank],
                 &mut self.scratch.dt,
             )?;
-            if let Some((bias_info, bias_data)) = self.weights.dt_proj_bias(layer as u32) {
+            if let Some(ref bias) = self.dt_proj_biases[layer] {
                 for i in 0..d_inner {
-                    self.scratch.dt[i] += read_weight_f32(bias_info, bias_data, i);
+                    if i < bias.len() {
+                        self.scratch.dt[i] += bias[i];
+                    }
                 }
             }
             // Softplus: log(1 + exp(x))
@@ -429,11 +532,11 @@ impl<'a> MambaRunner<'a> {
                 self.scratch.dt[i] = (1.0 + self.scratch.dt[i].exp()).ln();
             }
 
-            // Load A (stored as log, negate)
-            let (a_info, a_data) = self.weights.a_log(layer as u32)?;
-
             // SSM step: h = A_bar * h + B_bar * x, y = C * h + D * x
             // A_bar = exp(dt * A), B_bar = dt * B
+            // Uses pre-dequantized A_log and D to avoid dtype mismatch crashes
+            let a_log = &self.a_logs[layer];
+            let d_param = &self.d_params[layer];
             for i in 0..d_inner {
                 let dt_i = self.scratch.dt[i];
                 let x_i = self.scratch.x_conv[i];
@@ -441,7 +544,11 @@ impl<'a> MambaRunner<'a> {
                 let mut y_i = 0.0f32;
                 for j in 0..d_state {
                     let a_idx = i * d_state + j;
-                    let a_val = read_weight_f32(a_info, a_data, a_idx);
+                    let a_val = if a_idx < a_log.len() {
+                        a_log[a_idx]
+                    } else {
+                        0.0
+                    };
                     // A is stored as -exp(a_log), so A = -exp(a_val)
                     let a = -(a_val.exp());
                     let a_bar = (dt_i * a).exp();
@@ -454,8 +561,10 @@ impl<'a> MambaRunner<'a> {
                 }
 
                 // D * x (skip connection)
-                if let Some((d_info, d_data)) = self.weights.d(layer as u32) {
-                    y_i += read_weight_f32(d_info, d_data, i) * x_i;
+                if let Some(d_vec) = d_param {
+                    if i < d_vec.len() {
+                        y_i += d_vec[i] * x_i;
+                    }
                 }
 
                 self.scratch.y[i] = y_i;
