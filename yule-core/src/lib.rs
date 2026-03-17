@@ -1,3 +1,4 @@
+pub mod aqlm;
 pub mod async_io;
 pub mod chat_template;
 pub mod dequant;
@@ -8,6 +9,7 @@ pub mod error;
 pub mod gguf;
 #[cfg(all(target_arch = "x86_64", has_asm_kernels))]
 pub mod kernels;
+pub mod llvq;
 pub mod mmap;
 pub mod model;
 pub mod rank;
