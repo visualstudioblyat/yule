@@ -241,7 +241,12 @@ impl<'a> RwkvRunner<'a> {
         let meta = &store.meta;
         let dim = meta.embedding_dim as usize;
         let n_layers = meta.layer_count as usize;
-        let n_heads = meta.head_count as usize;
+        // RWKV may not have head_count in metadata; default to dim/64
+        let n_heads = if meta.head_count > 0 {
+            meta.head_count as usize
+        } else {
+            (dim / 64).max(1)
+        };
         let head_dim = dim / n_heads;
         let vocab_size = meta.vocab_size as usize;
 
