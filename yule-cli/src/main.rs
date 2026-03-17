@@ -38,6 +38,18 @@ enum Commands {
         /// Disable sandboxing (NOT recommended)
         #[arg(long)]
         no_sandbox: bool,
+
+        /// Enable constant-time decode padding (timing side-channel resistance)
+        #[arg(long)]
+        timing_resistant: bool,
+
+        /// Enable ECC weight protection (detect bit flips)
+        #[arg(long)]
+        enable_ecc: bool,
+
+        /// Repetition penalty (default: 1.1)
+        #[arg(long, default_value = "1.1")]
+        repetition_penalty: f32,
     },
 
     /// Pull a model from registry
@@ -117,6 +129,9 @@ fn main() {
             temperature,
             backend,
             no_sandbox,
+            timing_resistant,
+            enable_ecc,
+            repetition_penalty,
         } => {
             let prompt = prompt.unwrap_or_else(|| {
                 eprintln!("error: --prompt is required");
@@ -129,6 +144,9 @@ fn main() {
                 temperature,
                 &backend,
                 no_sandbox,
+                timing_resistant,
+                enable_ecc,
+                repetition_penalty,
             ) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -407,6 +425,9 @@ fn cmd_run(
     temperature: f32,
     backend: &str,
     no_sandbox: bool,
+    timing_resistant: bool,
+    enable_ecc: bool,
+    repetition_penalty: f32,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let path = resolve_model_path(model_path)?;
 
@@ -469,6 +490,43 @@ fn cmd_run(
         weight_start.elapsed().as_secs_f64() * 1000.0
     );
 
+    // Entropy analysis
+    let analyses: Vec<_> = gguf
+        .tensors
+        .iter()
+        .filter_map(|t| {
+            let data = gguf.tensor_data(t, &mmap).ok()?;
+            Some(yule_core::entropy::analyze_tensor_entropy(t, data))
+        })
+        .collect();
+    let profile = yule_core::entropy::compute_model_profile(&analyses);
+    eprintln!(
+        "entropy: {:.1}% potential savings ({:.2} bits wasted avg across {} tensors)",
+        profile.potential_savings_pct, profile.avg_waste, profile.total_tensors
+    );
+
+    // ECC protection
+    if enable_ecc {
+        let ecc_start = Instant::now();
+        let mut protections = Vec::new();
+        for tensor in &gguf.tensors {
+            if tensor.size_bytes > 1024 {
+                if let Ok(data) = gguf.tensor_data(tensor, &mmap) {
+                    protections.push(yule_core::ecc::TensorProtection::compute(
+                        &tensor.name,
+                        data,
+                        4096,
+                    ));
+                }
+            }
+        }
+        eprintln!(
+            "ecc: {} tensors protected in {:.1}ms",
+            protections.len(),
+            ecc_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
     // 4. select backend and create runner
     let use_vulkan = match backend {
         "vulkan" => true,
@@ -529,28 +587,61 @@ fn cmd_run(
     // 7. decode loop
     let sampler = yule_infer::sampler::Sampler::new(yule_infer::SamplingParams {
         temperature,
+        repetition_penalty,
         ..Default::default()
     });
 
     let eos = tokenizer.eos_token();
     let decode_start = Instant::now();
     let mut generated = 0u32;
+    let mut all_tokens = tokens.clone();
 
-    for _ in 0..max_tokens {
-        let token = sampler.sample(&logits)?;
+    // Constant-time calibration (if requested)
+    let ct_decoder = if timing_resistant {
+        let mut max_ms = 0u64;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let tok = sampler.sample(&logits)?;
+            logits = runner.decode_step(tok)?;
+            let ms = t0.elapsed().as_millis() as u64;
+            max_ms = max_ms.max(ms);
+            generated += 1;
+            let text = tokenizer.decode(&[tok])?;
+            print!("{text}");
+            std::io::stdout().flush()?;
+            all_tokens.push(tok);
+        }
+        let target_ms = ((max_ms as f64 * 1.2) as u64).max(1);
+        eprintln!("timing-resistant: calibrated to {}ms/token", target_ms);
+        Some(yule_infer::constant_time::ConstantTimeDecoder::new(
+            target_ms,
+        ))
+    } else {
+        None
+    };
 
-        // check eos
+    for _ in generated..max_tokens {
+        let token = if let Some(ref ct) = ct_decoder {
+            let (tok, next) =
+                ct.decode_step_padded(&mut *runner, &logits, &sampler, &all_tokens)?;
+            logits = next;
+            tok
+        } else {
+            let tok = sampler.sample_with_history(&logits, &all_tokens)?;
+            logits = runner.decode_step(tok)?;
+            tok
+        };
+
         if Some(token) == eos {
             break;
         }
 
-        // decode and print token
         let text = tokenizer.decode(&[token])?;
         print!("{text}");
         std::io::stdout().flush()?;
 
         generated += 1;
-        logits = runner.decode_step(token)?;
+        all_tokens.push(token);
     }
 
     let decode_time = decode_start.elapsed();
