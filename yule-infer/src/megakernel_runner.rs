@@ -109,10 +109,13 @@ impl<'a> MegakernelRunner<'a> {
         let k_cache = backend.allocate(n_layers * kv_layer_size)?;
         let v_cache = backend.allocate(n_layers * kv_layer_size)?;
 
-        // Scratch buffer for intermediate activations
+        // Scratch buffer for intermediate activations (multi-workgroup layout)
         // Q(2048) + K(256) + V(256) + attn_out(2048) + attn_proj(2048) +
-        // gate(5632) + up(5632) + ffn_out(2048)
-        let scratch_size = (dim + kv_dim + kv_dim + dim + dim + ff_dim + ff_dim + dim) * 4;
+        // gate(5632) + up(5632) + ffn_out(2048) + hidden(2048) + residual(2048) +
+        // temp(2048) + sync(4) + partials(32)
+        let scratch_floats = dim + kv_dim + kv_dim + dim + dim + ff_dim + ff_dim + dim
+            + dim + dim + dim + 4 + 32;
+        let scratch_size = scratch_floats * 4;
         let scratch = backend.allocate(scratch_size)?;
 
         // Input/output
@@ -201,11 +204,16 @@ impl<'a> MegakernelRunner<'a> {
         }
         total_bytes = (total_bytes + 3) & !3;
         offsets.push((total_bytes / 4) as u32);
-        if let Ok((info, _)) = w
+        // Output weight: must be Q4_0 for the megakernel's QMV.
+        // If output.weight is a different quant (e.g. Q6_K), fall back to
+        // token_embd.weight (weight-tied models share embeddings).
+        let output_tensor = w
             .store
             .require("output.weight")
-            .or_else(|_| w.store.require("token_embd.weight"))
-        {
+            .ok()
+            .filter(|(info, _)| info.dtype == DType::Q4_0)
+            .or_else(|| w.store.require("token_embd.weight").ok());
+        if let Some((info, _)) = output_tensor {
             total_bytes += info.size_bytes as usize;
         }
 
@@ -244,17 +252,20 @@ impl<'a> MegakernelRunner<'a> {
             pos += d.len();
         }
         pos = (pos + 3) & !3;
-        if let Ok((_, d)) = w
+        let output_tensor_copy = w
             .store
             .require("output.weight")
-            .or_else(|_| w.store.require("token_embd.weight"))
-        {
+            .ok()
+            .filter(|(info, _)| info.dtype == DType::Q4_0)
+            .or_else(|| w.store.require("token_embd.weight").ok());
+        if let Some((_, d)) = output_tensor_copy {
             data[pos..pos + d.len()].copy_from_slice(d);
         }
 
         backend.copy_to_device(&data, &packed)?;
 
-        // Upload offset table
+        // Upload offset table (+ 1 extra slot for grid sync counter at index 200)
+        offsets.push(0); // sync counter initialized to 0
         let offset_buf = backend.allocate(offsets.len() * 4)?;
         let offset_bytes: &[u8] = bytemuck::cast_slice(&offsets);
         backend.copy_to_device(offset_bytes, &offset_buf)?;
@@ -262,6 +273,7 @@ impl<'a> MegakernelRunner<'a> {
         // Debug: print output weight offset
         let output_weight_idx = cfg.n_layers * 9 + 1;
         let output_norm_idx = cfg.n_layers * 9;
+        // Print offset summary
         tracing::info!(
             "megakernel: packed {} MB weights, {} offset entries. output_norm_offset={}, output_weight_offset={} (uint), byte={}",
             total_bytes / (1024 * 1024),
@@ -409,9 +421,9 @@ impl<'a> MegakernelRunner<'a> {
                 &self.norm_weights,
             ],
             bytemuck::cast_slice(&_push),
+            28, // 28 workgroups = optimal for RTX 3060
             1,
             1,
-            1, // single workgroup
         )?;
 
         self.backend.submit_batch(cmd)?;
@@ -432,39 +444,9 @@ impl<'a> MegakernelRunner<'a> {
             .unwrap_or(0);
         let non_zero = logits_cpu.iter().filter(|&&v| v != 0.0).count();
         let nan_count = logits_cpu.iter().filter(|v| v.is_nan()).count();
-        // Debug checkpoints from shader
-        let vs = self.cfg.vocab_size;
-        eprintln!(
-            "DEBUG: Q[0]={:.4} Q[1]={:.4} Q[2]={:.4} K[0]={:.4} s_temp[0]={:.4} s_temp[1]={:.4}",
-            logits_cpu[vs - 11],
-            logits_cpu[vs - 20],
-            logits_cpu[vs - 21],
-            logits_cpu[vs - 12],
-            logits_cpu[vs - 18],
-            logits_cpu[vs - 19]
-        );
-        eprintln!(
-            "DEBUG: attn_out[0]={:.4} hidden[0]={:.4} hidden[1]={:.4} nan_count={:.0} gate={:.4} ffn_out={:.4}",
-            logits_cpu[vs - 10],
-            logits_cpu[vs - 13],
-            logits_cpu[vs - 14],
-            logits_cpu[vs - 15],
-            logits_cpu[vs - 16],
-            logits_cpu[vs - 17]
-        );
-        eprintln!(
-            "megakernel logits: min={:.4} max={:.4} argmax={} non_zero={}/{} nan={} first5=[{:.4},{:.4},{:.4},{:.4},{:.4}]",
-            min_val,
-            max_val,
-            argmax,
-            non_zero,
-            logits_cpu.len(),
-            nan_count,
-            logits_cpu[0],
-            logits_cpu[1],
-            logits_cpu[2],
-            logits_cpu[3],
-            logits_cpu[4]
+        tracing::debug!(
+            "megakernel logits: min={:.2} max={:.2} argmax={} nan={}",
+            min_val, max_val, argmax, nan_count
         );
 
         self.pos += 1;
