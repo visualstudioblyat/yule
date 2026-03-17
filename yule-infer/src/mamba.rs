@@ -54,6 +54,73 @@ fn qmv(weight_info: &TensorInfo, weight_data: &[u8], input: &[f32], out: &mut [f
     Ok(())
 }
 
+/// Dequantize a full tensor to f32. Works for any dtype including quantized formats.
+fn dequant_tensor(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
+    let dtype = info.dtype;
+    let n_elements = info.num_elements() as usize;
+
+    if dtype == DType::F32 {
+        let mut out = vec![0.0f32; n_elements];
+        for i in 0..n_elements {
+            out[i] = f32::from_le_bytes([
+                data[i * 4],
+                data[i * 4 + 1],
+                data[i * 4 + 2],
+                data[i * 4 + 3],
+            ]);
+        }
+        return out;
+    }
+
+    if dtype == DType::F16 {
+        let mut out = vec![0.0f32; n_elements];
+        for i in 0..n_elements {
+            let bits = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+            out[i] = dequant::f16_to_f32(bits);
+        }
+        return out;
+    }
+
+    // Quantized format: dequantize block by block
+    let block_size = dtype.block_size();
+    let block_bytes = dtype.size_of_block();
+    let n_blocks = data.len() / block_bytes;
+    let mut out = vec![0.0f32; n_blocks * block_size];
+    for b in 0..n_blocks {
+        let block = &data[b * block_bytes..(b + 1) * block_bytes];
+        let _ =
+            dequant::dequant_block(dtype, block, &mut out[b * block_size..(b + 1) * block_size]);
+    }
+    out
+}
+
+/// Read a single f32 value from a tensor at a given element index, handling any dtype.
+fn read_weight_f32(info: &TensorInfo, data: &[u8], index: usize) -> f32 {
+    match info.dtype {
+        DType::F32 => f32::from_le_bytes([
+            data[index * 4],
+            data[index * 4 + 1],
+            data[index * 4 + 2],
+            data[index * 4 + 3],
+        ]),
+        DType::F16 => {
+            let bits = u16::from_le_bytes([data[index * 2], data[index * 2 + 1]]);
+            dequant::f16_to_f32(bits)
+        }
+        _ => {
+            // For quantized types, dequant the containing block and extract
+            let bs = info.dtype.block_size();
+            let bb = info.dtype.size_of_block();
+            let block_idx = index / bs;
+            let elem_idx = index % bs;
+            let block = &data[block_idx * bb..(block_idx + 1) * bb];
+            let mut tmp = vec![0.0f32; bs];
+            let _ = dequant::dequant_block(info.dtype, block, &mut tmp);
+            tmp[elem_idx]
+        }
+    }
+}
+
 fn rms_norm(x: &[f32], weight_data: &[u8], weight_info: &TensorInfo, eps: f32, out: &mut [f32]) {
     let n = x.len();
     let mut ss = 0.0f32;
@@ -63,17 +130,7 @@ fn rms_norm(x: &[f32], weight_data: &[u8], weight_info: &TensorInfo, eps: f32, o
     let inv = 1.0 / (ss / n as f32 + eps).sqrt();
 
     for i in 0..n {
-        let w = if weight_info.dtype == DType::F32 {
-            f32::from_le_bytes([
-                weight_data[i * 4],
-                weight_data[i * 4 + 1],
-                weight_data[i * 4 + 2],
-                weight_data[i * 4 + 3],
-            ])
-        } else {
-            let bits = u16::from_le_bytes([weight_data[i * 2], weight_data[i * 2 + 1]]);
-            dequant::f16_to_f32(bits)
-        };
+        let w = read_weight_f32(weight_info, weight_data, i);
         out[i] = x[i] * inv * w;
     }
 }
@@ -320,18 +377,7 @@ impl<'a> MambaRunner<'a> {
                 let mut sum = 0.0f32;
                 for k in 0..d_conv {
                     let w_idx = i * d_conv + k;
-                    let w = if conv_info.dtype == DType::F32 {
-                        f32::from_le_bytes([
-                            conv_data[w_idx * 4],
-                            conv_data[w_idx * 4 + 1],
-                            conv_data[w_idx * 4 + 2],
-                            conv_data[w_idx * 4 + 3],
-                        ])
-                    } else {
-                        let bits =
-                            u16::from_le_bytes([conv_data[w_idx * 2], conv_data[w_idx * 2 + 1]]);
-                        dequant::f16_to_f32(bits)
-                    };
+                    let w = read_weight_f32(conv_info, conv_data, w_idx);
                     sum += state.conv_state[i * d_conv + k] * w;
                 }
                 self.scratch.x_conv[i] = sum;
@@ -340,18 +386,7 @@ impl<'a> MambaRunner<'a> {
             // Add conv bias if present
             if let Some((bias_info, bias_data)) = self.weights.conv1d_bias(layer as u32) {
                 for i in 0..d_inner {
-                    let b = if bias_info.dtype == DType::F32 {
-                        f32::from_le_bytes([
-                            bias_data[i * 4],
-                            bias_data[i * 4 + 1],
-                            bias_data[i * 4 + 2],
-                            bias_data[i * 4 + 3],
-                        ])
-                    } else {
-                        let bits = u16::from_le_bytes([bias_data[i * 2], bias_data[i * 2 + 1]]);
-                        dequant::f16_to_f32(bits)
-                    };
-                    self.scratch.x_conv[i] += b;
+                    self.scratch.x_conv[i] += read_weight_f32(bias_info, bias_data, i);
                 }
             }
 
@@ -386,18 +421,7 @@ impl<'a> MambaRunner<'a> {
             )?;
             if let Some((bias_info, bias_data)) = self.weights.dt_proj_bias(layer as u32) {
                 for i in 0..d_inner {
-                    let b = if bias_info.dtype == DType::F32 {
-                        f32::from_le_bytes([
-                            bias_data[i * 4],
-                            bias_data[i * 4 + 1],
-                            bias_data[i * 4 + 2],
-                            bias_data[i * 4 + 3],
-                        ])
-                    } else {
-                        let bits = u16::from_le_bytes([bias_data[i * 2], bias_data[i * 2 + 1]]);
-                        dequant::f16_to_f32(bits)
-                    };
-                    self.scratch.dt[i] += b;
+                    self.scratch.dt[i] += read_weight_f32(bias_info, bias_data, i);
                 }
             }
             // Softplus: log(1 + exp(x))
@@ -417,17 +441,7 @@ impl<'a> MambaRunner<'a> {
                 let mut y_i = 0.0f32;
                 for j in 0..d_state {
                     let a_idx = i * d_state + j;
-                    let a_val = if a_info.dtype == DType::F32 {
-                        f32::from_le_bytes([
-                            a_data[a_idx * 4],
-                            a_data[a_idx * 4 + 1],
-                            a_data[a_idx * 4 + 2],
-                            a_data[a_idx * 4 + 3],
-                        ])
-                    } else {
-                        let bits = u16::from_le_bytes([a_data[a_idx * 2], a_data[a_idx * 2 + 1]]);
-                        dequant::f16_to_f32(bits)
-                    };
+                    let a_val = read_weight_f32(a_info, a_data, a_idx);
                     // A is stored as -exp(a_log), so A = -exp(a_val)
                     let a = -(a_val.exp());
                     let a_bar = (dt_i * a).exp();
@@ -441,18 +455,7 @@ impl<'a> MambaRunner<'a> {
 
                 // D * x (skip connection)
                 if let Some((d_info, d_data)) = self.weights.d(layer as u32) {
-                    let d_val = if d_info.dtype == DType::F32 {
-                        f32::from_le_bytes([
-                            d_data[i * 4],
-                            d_data[i * 4 + 1],
-                            d_data[i * 4 + 2],
-                            d_data[i * 4 + 3],
-                        ])
-                    } else {
-                        let bits = u16::from_le_bytes([d_data[i * 2], d_data[i * 2 + 1]]);
-                        dequant::f16_to_f32(bits)
-                    };
-                    y_i += d_val * x_i;
+                    y_i += read_weight_f32(d_info, d_data, i) * x_i;
                 }
 
                 self.scratch.y[i] = y_i;
