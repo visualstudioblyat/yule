@@ -75,6 +75,9 @@ pub struct GpuTransformerRunner<'a> {
     k_cache: Vec<BufferHandle>,
     v_cache: Vec<BufferHandle>,
     pos: usize,
+    /// Tracks descriptor sets allocated since last pool reset.
+    /// The pool supports 8192 sets; we reset lazily when nearing capacity.
+    descriptor_sets_used: u32,
 
     // Keep CPU-side reference for embedding lookup (single row copy, negligible)
     cpu_weights: TransformerWeights<'a>,
@@ -160,6 +163,7 @@ impl<'a> GpuTransformerRunner<'a> {
             k_cache,
             v_cache,
             pos: 0,
+            descriptor_sets_used: 0,
             cpu_weights,
         })
     }
@@ -339,8 +343,15 @@ impl<'a> GpuTransformerRunner<'a> {
             .copy_to_device(bytemuck::cast_slice(&hidden_f32), &self.scratch.hidden)?;
 
         // 2. Batched forward pass — single command buffer for all layers
-        // Reset descriptor pool from previous forward pass (all sets are stale after fence wait)
-        self.backend.reset_descriptors()?;
+        // Lazy descriptor pool reset: each forward pass uses ~(14 * n_layers + 2) sets.
+        // The pool holds 8192 sets, so we only reset when approaching capacity.
+        // This eliminates vkResetDescriptorPool overhead on every token.
+        let sets_per_pass = (14 * self.cfg.n_layers + 2) as u32;
+        if self.descriptor_sets_used + sets_per_pass > 8000 {
+            self.backend.reset_descriptors()?;
+            self.descriptor_sets_used = 0;
+        }
+        self.descriptor_sets_used += sets_per_pass;
         let cmd = self.backend.begin_batch()?;
 
         for layer in 0..self.cfg.n_layers {
@@ -703,5 +714,7 @@ impl<'a> ModelRunner for GpuTransformerRunner<'a> {
 
     fn reset(&mut self) {
         self.pos = 0;
+        // Force descriptor pool reset on next forward pass
+        self.descriptor_sets_used = 8001;
     }
 }
