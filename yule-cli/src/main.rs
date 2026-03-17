@@ -607,19 +607,33 @@ fn cmd_run(
     #[allow(unused_mut)]
     let mut runner: Box<dyn ModelRunner>;
 
-    if use_vulkan {
-        #[cfg(feature = "vulkan")]
-        {
-            eprintln!("backend: vulkan");
-            runner = Box::new(yule_infer::gpu_runner::GpuTransformerRunner::new(weights)?);
+    use yule_core::model::Architecture;
+
+    match &model_info.metadata.architecture {
+        Architecture::Mamba => {
+            eprintln!("backend: cpu (mamba SSM)");
+            runner = Box::new(yule_infer::mamba::MambaRunner::new(&weights.store)?);
         }
-        #[cfg(not(feature = "vulkan"))]
-        {
-            return Err("vulkan feature not compiled in".into());
+        Architecture::Rwkv => {
+            eprintln!("backend: cpu (rwkv linear attention)");
+            runner = Box::new(yule_infer::rwkv::RwkvRunner::new(&weights.store)?);
         }
-    } else {
-        eprintln!("backend: cpu");
-        runner = Box::new(yule_infer::model_runner::TransformerRunner::new(weights)?);
+        _ => {
+            if use_vulkan {
+                #[cfg(feature = "vulkan")]
+                {
+                    eprintln!("backend: vulkan");
+                    runner = Box::new(yule_infer::gpu_runner::GpuTransformerRunner::new(weights)?);
+                }
+                #[cfg(not(feature = "vulkan"))]
+                {
+                    return Err("vulkan feature not compiled in".into());
+                }
+            } else {
+                eprintln!("backend: cpu");
+                runner = Box::new(yule_infer::model_runner::TransformerRunner::new(weights)?);
+            }
+        }
     }
 
     if dynamic_quant {
