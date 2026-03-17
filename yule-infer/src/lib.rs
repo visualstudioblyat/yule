@@ -6,6 +6,8 @@ pub mod dynamic_quant;
 pub mod gpu_runner;
 pub mod kv_cache;
 pub mod mamba;
+#[cfg(feature = "vulkan")]
+pub mod megakernel_runner;
 pub mod mixture_of_depths;
 pub mod mla;
 pub mod model_runner;
