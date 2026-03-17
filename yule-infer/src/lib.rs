@@ -9,6 +9,8 @@ pub mod model_runner;
 pub mod rwkv;
 pub mod sampler;
 pub mod speculative;
+pub mod thread_pool;
+pub mod verified_kv;
 pub mod weight_loader;
 
 use yule_core::error::Result;
@@ -24,6 +26,7 @@ pub struct InferenceEngine {
     // (runner borrows from weight_data; Rust drops fields in declaration order)
     runner: Option<Box<dyn ModelRunner>>,
     weight_data: Option<Vec<u8>>,
+    entropy_profile: Option<yule_core::entropy::ModelEntropyProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +85,7 @@ impl InferenceEngine {
             config,
             runner: None,
             weight_data: None,
+            entropy_profile: None,
         }
     }
 
@@ -127,7 +131,30 @@ impl InferenceEngine {
         };
 
         self.runner = Some(runner);
+
+        // Entropy analysis — runs once at load time
+        let analyses: Vec<_> = gguf
+            .tensors
+            .iter()
+            .filter_map(|t| {
+                let data = gguf.tensor_data(t, static_ref).ok()?;
+                Some(yule_core::entropy::analyze_tensor_entropy(t, data))
+            })
+            .collect();
+        let profile = yule_core::entropy::compute_model_profile(&analyses);
+        tracing::info!(
+            "entropy: {:.1}% potential savings ({:.2} bits wasted avg, {} tensors)",
+            profile.potential_savings_pct,
+            profile.avg_waste,
+            profile.total_tensors
+        );
+        self.entropy_profile = Some(profile);
+
         Ok(())
+    }
+
+    pub fn entropy_profile(&self) -> Option<&yule_core::entropy::ModelEntropyProfile> {
+        self.entropy_profile.as_ref()
     }
 
     pub fn generate(&mut self, request: &GenerateRequest) -> Result<Vec<u32>> {
