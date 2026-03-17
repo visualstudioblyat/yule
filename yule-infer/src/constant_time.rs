@@ -102,7 +102,7 @@ impl ConstantTimeDecoder {
 /// Busy-wait until the target instant.
 /// Uses a spin loop with no sleep (sleep has unpredictable wakeup latency).
 /// Includes a `spin_loop` hint to reduce power consumption while spinning.
-fn busy_wait_until(target: Instant) {
+pub fn busy_wait_until(target: Instant) {
     while Instant::now() < target {
         std::hint::spin_loop();
     }

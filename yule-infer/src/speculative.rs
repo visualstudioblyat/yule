@@ -575,6 +575,65 @@ pub fn speculative_decode_step(
     })
 }
 
+/// Speculative decode with constant-time padding.
+/// The entire draft+verify cycle takes exactly `target_duration` wall-clock time,
+/// regardless of how many draft tokens were accepted.
+pub fn speculative_decode_step_padded(
+    runner: &mut dyn crate::model_runner::ModelRunner,
+    last_logits: &[f32],
+    config: &SpeculativeConfig,
+    sampler: &Sampler,
+    temperature: f32,
+    target_duration: std::time::Duration,
+) -> Result<SpeculativeResult> {
+    let start = std::time::Instant::now();
+
+    let result = speculative_decode_step(runner, last_logits, config, sampler, temperature)?;
+
+    // Pad to target duration
+    let elapsed = start.elapsed();
+    if elapsed < target_duration {
+        crate::constant_time::busy_wait_until(start + target_duration);
+    }
+
+    Ok(result)
+}
+
+/// Speculative decode with constant-time padding and random noise.
+/// Adds random noise to the target duration to prevent fixed-pattern detection.
+pub fn speculative_decode_step_with_noise(
+    runner: &mut dyn crate::model_runner::ModelRunner,
+    last_logits: &[f32],
+    config: &SpeculativeConfig,
+    sampler: &Sampler,
+    temperature: f32,
+    target_duration: std::time::Duration,
+    noise_amplitude_us: u64,
+) -> Result<SpeculativeResult> {
+    let start = std::time::Instant::now();
+
+    let result = speculative_decode_step(runner, last_logits, config, sampler, temperature)?;
+
+    // Add random noise to the target
+    let noise = if noise_amplitude_us > 0 {
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes)
+            .map_err(|e| YuleError::Inference(format!("CSPRNG failed: {e}")))?;
+        std::time::Duration::from_micros(u64::from_le_bytes(bytes) % noise_amplitude_us)
+    } else {
+        std::time::Duration::ZERO
+    };
+
+    let padded_target = target_duration + noise;
+
+    let elapsed = start.elapsed();
+    if elapsed < padded_target {
+        crate::constant_time::busy_wait_until(start + padded_target);
+    }
+
+    Ok(result)
+}
+
 /// Convert logits to probability distribution (softmax).
 pub fn logits_to_probs(logits: &[f32], temperature: f32) -> Vec<f32> {
     let mut scaled = logits.to_vec();
@@ -871,5 +930,31 @@ mod tests {
         // Only the first position should be accepted for the best candidate.
         assert_eq!(result.acceptance_length, 1);
         assert_eq!(result.accepted_tokens, vec![5]);
+    }
+
+    #[test]
+    fn test_padded_spec_decode_constant_time() {
+        // We cannot easily construct a full ModelRunner without a real model,
+        // so we test the busy_wait_until timing primitive that underpins the
+        // padded function. This verifies that the padding mechanism works.
+        let target = std::time::Duration::from_millis(20);
+        let start = std::time::Instant::now();
+
+        // Simulate: work finishes instantly, then pad to target
+        let elapsed = start.elapsed();
+        if elapsed < target {
+            crate::constant_time::busy_wait_until(start + target);
+        }
+
+        let total = start.elapsed();
+        assert!(
+            total >= target,
+            "padded duration {total:?} should be >= target {target:?}"
+        );
+        // Allow up to 5ms overshoot (OS scheduling jitter)
+        assert!(
+            total < target + std::time::Duration::from_millis(5),
+            "padded duration {total:?} overshot target {target:?} by too much"
+        );
     }
 }
