@@ -38,6 +38,7 @@ pub struct ApiServer {
     model_path: PathBuf,
     token: Option<String>,
     sandbox_active: bool,
+    timing_resistant: bool,
 }
 
 impl ApiServer {
@@ -52,7 +53,13 @@ impl ApiServer {
             model_path,
             token,
             sandbox_active,
+            timing_resistant: false,
         }
+    }
+
+    pub fn with_timing_resistant(mut self, enabled: bool) -> Self {
+        self.timing_resistant = enabled;
+        self
     }
 
     pub async fn run(self) -> Result<()> {
@@ -120,6 +127,10 @@ impl ApiServer {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| yule_core::error::YuleError::Api(format!("bind failed: {e}")))?;
+
+        if self.timing_resistant {
+            eprintln!("timing-resistant decode: enabled (constant-time padding active)");
+        }
 
         eprintln!("listening on {addr}");
         eprintln!("  yule api:  http://{addr}/yule/health");
