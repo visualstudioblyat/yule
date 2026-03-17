@@ -1,0 +1,105 @@
+#version 450
+
+// Flash-Decoding: split-KV parallelization for decode phase.
+// Each workgroup handles one split of the KV cache.
+// Output: partial attention output + log-sum-exp for online combination.
+//
+// Reference: Flash-Decoding (Stanford CRFM, 2023)
+// Speedup: up to 8x for long sequences.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Query { float query[]; };
+layout(set = 0, binding = 1) buffer KeyCache { float key_cache[]; };
+layout(set = 0, binding = 2) buffer ValueCache { float value_cache[]; };
+layout(set = 0, binding = 3) buffer PartialOut { float partial_out[]; };
+layout(set = 0, binding = 4) buffer PartialLSE { float partial_lse[]; };
+layout(set = 0, binding = 5) buffer PartialMax { float partial_max[]; };
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint split_start;    // first position in this split
+    uint split_end;      // last position + 1
+    uint head_offset;    // offset into query for this head
+    uint kv_offset;      // offset within each position for this KV head
+    uint kv_stride;      // total elements per position in KV cache
+    uint split_idx;      // which split this is
+};
+
+shared float partial_dots[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint split_len = split_end - split_start;
+    float scale = 1.0 / sqrt(float(head_dim));
+
+    // Phase 1: Compute attention scores for this split
+    // Each thread handles one or more positions
+    float local_max = -1.0e30;
+    float local_sum = 0.0;
+
+    // Accumulate partial output for this thread
+    // Each thread computes scores for its positions and accumulates weighted V
+    for (uint pos = split_start + tid; pos < split_end; pos += gl_WorkGroupSize.x) {
+        float dot = 0.0;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += query[head_offset + d] * key_cache[pos * kv_stride + kv_offset + d];
+        }
+        float score = dot * scale;
+
+        // Online softmax: track running max and sum
+        if (score > local_max) {
+            local_sum = local_sum * exp(local_max - score) + exp(0.0);
+            local_max = score;
+        } else {
+            local_sum += exp(score - local_max);
+        }
+    }
+
+    // Phase 2: Reduction to find global max within this split
+    partial_dots[tid] = local_max;
+    barrier();
+
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_dots[tid] = max(partial_dots[tid], partial_dots[tid + s]);
+        }
+        barrier();
+    }
+    float split_max = partial_dots[0];
+    barrier();
+
+    // Phase 3: Compute exp-normalized scores and weighted V
+    // Rescale local_sum to use the global split_max
+    local_sum = local_sum * exp(local_max - split_max);
+
+    // Sum reduction for total exp sum
+    partial_dots[tid] = local_sum;
+    barrier();
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) partial_dots[tid] += partial_dots[tid + s];
+        barrier();
+    }
+    float split_lse = partial_dots[0];
+    barrier();
+
+    // Phase 4: Write partial output (weighted V sum)
+    // For simplicity, compute per-dimension output via reduction
+    for (uint d = tid; d < head_dim; d += gl_WorkGroupSize.x) {
+        float weighted_sum = 0.0;
+        for (uint pos = split_start; pos < split_end; pos++) {
+            float dot = 0.0;
+            for (uint dd = 0; dd < head_dim; dd++) {
+                dot += query[head_offset + dd] * key_cache[pos * kv_stride + kv_offset + dd];
+            }
+            float score = exp(dot * scale - split_max);
+            weighted_sum += score * value_cache[pos * kv_stride + kv_offset + d];
+        }
+        partial_out[split_idx * head_dim + d] = weighted_sum;
+    }
+
+    if (tid == 0) {
+        partial_lse[split_idx] = split_lse;
+        partial_max[split_idx] = split_max;
+    }
+}
