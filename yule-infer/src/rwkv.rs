@@ -176,63 +176,107 @@ impl<'a> RwkvWeights<'a> {
         self.store.require(&format!("blk.{layer}.ffn_norm.weight"))
     }
 
-    // Time-mix weights
+    // Time-mix weights (v5/v6 names with v7 fallbacks)
     fn attn_receptance(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
         self.store
             .require(&format!("blk.{layer}.attn_receptance.weight"))
+            .or_else(|_| self.store.require(&format!("blk.{layer}.attn_r.weight")))
     }
     fn attn_key(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.attn_key.weight"))
+        self.store
+            .require(&format!("blk.{layer}.attn_key.weight"))
+            .or_else(|_| self.store.require(&format!("blk.{layer}.attn_k.weight")))
     }
     fn attn_value(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
         self.store
             .require(&format!("blk.{layer}.attn_value.weight"))
+            .or_else(|_| self.store.require(&format!("blk.{layer}.attn_v.weight")))
     }
     fn attn_output(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
         self.store
             .require(&format!("blk.{layer}.attn_output.weight"))
+            .or_else(|_| self.store.require(&format!("blk.{layer}.attn_o.weight")))
     }
     fn attn_gate(&self, layer: u32) -> Option<(&TensorInfo, &[u8])> {
-        self.store.get(&format!("blk.{layer}.attn_gate.weight"))
+        self.store
+            .get(&format!("blk.{layer}.attn_gate.weight"))
+            .or_else(|| self.store.get(&format!("blk.{layer}.attn_g.weight")))
     }
 
-    // Time-mix interpolation ratios
+    // Time-mix interpolation ratios (v5/v6 names with v7 fallbacks)
     fn time_mix_r(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.time_mix_r"))
+        self.store
+            .require(&format!("blk.{layer}.time_mix_r"))
+            .or_else(|_| {
+                self.store
+                    .require(&format!("blk.{layer}.attn_lerp_r.weight"))
+            })
     }
     fn time_mix_k(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.time_mix_k"))
+        self.store
+            .require(&format!("blk.{layer}.time_mix_k"))
+            .or_else(|_| {
+                self.store
+                    .require(&format!("blk.{layer}.attn_lerp_k.weight"))
+            })
     }
     fn time_mix_v(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.time_mix_v"))
+        self.store
+            .require(&format!("blk.{layer}.time_mix_v"))
+            .or_else(|_| {
+                self.store
+                    .require(&format!("blk.{layer}.attn_lerp_v.weight"))
+            })
     }
 
-    // Time-mix decay and bonus
+    // Time-mix decay and bonus (v5/v6 names with v7 fallbacks)
     fn time_mix_w(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.time_mix_w"))
+        self.store
+            .require(&format!("blk.{layer}.time_mix_w"))
+            .or_else(|_| {
+                self.store
+                    .require(&format!("blk.{layer}.attn_decay.weight"))
+            })
     }
     fn time_first(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.time_first"))
+        self.store
+            .require(&format!("blk.{layer}.time_first"))
+            .or_else(|_| self.store.require(&format!("blk.{layer}.attn_a.weight")))
     }
 
-    // Channel-mix weights
+    // Channel-mix weights (v5/v6 names with v7 fallbacks)
     fn ffn_receptance(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
         self.store
             .require(&format!("blk.{layer}.ffn_receptance.weight"))
+            .or_else(|_| self.store.require(&format!("blk.{layer}.ffn_r.weight")))
     }
     fn ffn_key(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.ffn_key.weight"))
+        self.store
+            .require(&format!("blk.{layer}.ffn_key.weight"))
+            .or_else(|_| self.store.require(&format!("blk.{layer}.ffn_k.weight")))
     }
     fn ffn_value(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.ffn_value.weight"))
+        self.store
+            .require(&format!("blk.{layer}.ffn_value.weight"))
+            .or_else(|_| self.store.require(&format!("blk.{layer}.ffn_v.weight")))
     }
 
-    // Channel-mix interpolation ratios
+    // Channel-mix interpolation ratios (v5/v6 names with v7 fallbacks)
     fn time_mix_r_ffn(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.time_mix_r_ffn"))
+        self.store
+            .require(&format!("blk.{layer}.time_mix_r_ffn"))
+            .or_else(|_| {
+                self.store
+                    .require(&format!("blk.{layer}.ffn_lerp_r.weight"))
+            })
     }
     fn time_mix_k_ffn(&self, layer: u32) -> Result<(&TensorInfo, &[u8])> {
-        self.store.require(&format!("blk.{layer}.time_mix_k_ffn"))
+        self.store
+            .require(&format!("blk.{layer}.time_mix_k_ffn"))
+            .or_else(|_| {
+                self.store
+                    .require(&format!("blk.{layer}.ffn_lerp_k.weight"))
+            })
     }
 }
 
