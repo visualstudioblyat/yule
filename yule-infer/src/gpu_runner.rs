@@ -460,9 +460,9 @@ impl<'a> GpuTransformerRunner<'a> {
 
             // Attention — per-head GQA dispatch
             let kv_group = n_heads / n_kv_heads;
-            // Flash-Decoding: use split-KV for any non-trivial sequence
-            // Eliminates 2,112 per-head dispatches per token (the #1 bottleneck)
-            let use_flash_decode = seq_len >= 4;
+            // Flash-Decoding for long sequences only — split-KV has overhead that
+            // exceeds per-head dispatch cost for short sequences
+            let use_flash_decode = seq_len >= 256;
 
             if use_flash_decode {
                 // Flash-Decoding: split-KV attention for long sequences

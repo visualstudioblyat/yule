@@ -190,14 +190,13 @@ impl VulkanBackend {
         kv_stride: u32,
         out_offset: u32,
     ) -> Result<()> {
-        let split_threshold = 256; // only use flash-decode for long sequences
-
-        if seq_len < split_threshold {
-            // Fall back to standard attn_score + softmax + attn_value
-            return Ok(()); // caller should use the existing per-head attention path
+        // Flash-Decoding only beneficial for long sequences where the per-head
+        // dispatch overhead (96 dispatches × barriers) exceeds split-KV overhead
+        if seq_len < 256 {
+            return Ok(());
         }
 
-        let num_splits = ((seq_len + 255) / 256).min(16); // max 16 splits
+        let num_splits = seq_len.div_ceil(256).min(16);
         let split_size = (seq_len + num_splits - 1) / num_splits;
 
         // Allocate temporary buffers for partial results
