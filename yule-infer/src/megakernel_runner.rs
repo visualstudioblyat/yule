@@ -170,12 +170,25 @@ impl<'a> MegakernelRunner<'a> {
                 format!("blk.{layer}.ffn_down.weight"),
             ];
 
-            for name in &tensor_names {
+            for (t_idx, name) in tensor_names.iter().enumerate() {
                 // Align to 4 bytes
                 total_bytes = (total_bytes + 3) & !3;
                 offsets.push((total_bytes / 4) as u32); // uint offset
-                if let Ok((info, _)) = w.store.require(name) {
+                if let Ok((info, data)) = w.store.require(name) {
+                    if l == 0 {
+                        tracing::debug!(
+                            "  tensor[{}] {}: offset={} bytes={} dtype={:?} data_len={}",
+                            t_idx,
+                            name,
+                            total_bytes,
+                            info.size_bytes,
+                            info.dtype,
+                            data.len()
+                        );
+                    }
                     total_bytes += info.size_bytes as usize;
+                } else if l == 0 {
+                    tracing::warn!("  tensor[{}] {} NOT FOUND", t_idx, name);
                 }
             }
         }
