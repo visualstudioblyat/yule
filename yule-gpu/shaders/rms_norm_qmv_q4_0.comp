@@ -1,0 +1,123 @@
+#version 450
+
+// Fused RMSNorm + Q4_0 quantized matmul.
+// Eliminates one dispatch + one barrier per fusion (44 per token for attention+FFN norms).
+//
+// Step 1: RMSNorm the input in shared memory (cooperative reduction)
+// Step 2: Q4_0 matmul against the normalized input (no global memory write of normed)
+//
+// This saves:
+// - 1 global memory write of the normed vector (dim * 4 bytes)
+// - 1 global memory read of the normed vector by the matmul
+// - 1 vkCmdDispatch + 1 vkCmdPipelineBarrier
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Input { float input_data[]; };
+layout(set = 0, binding = 1) buffer NormWeight { float norm_weight[]; };
+layout(set = 0, binding = 2) buffer MatWeight { uint mat_weight[]; };
+layout(set = 0, binding = 3) buffer Output { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint dim;        // input dimension
+    uint n_rows;     // output rows (matmul)
+    uint n_cols;     // input cols = dim
+    uint blocks_per_row;
+    float eps;
+};
+
+shared float normed[2048]; // max dim we support in shared memory
+shared float partial_sums[256];
+
+float unpack_f16(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) {
+        float val = ldexp(float(mant), -24);
+        return sign == 1u ? -val : val;
+    }
+    if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+    float val = ldexp(float(mant | 0x400u), int(exp) - 25);
+    return sign == 1u ? -val : val;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= n_rows) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    // ── Step 1: RMSNorm into shared memory ──
+    // Only the first workgroup (or all workgroups redundantly) computes the norm.
+    // Since all workgroups need the same normed input, compute it redundantly
+    // (it's fast in shared memory and avoids a global sync).
+
+    // Compute sum of squares
+    float ss = 0.0;
+    for (uint i = tid; i < dim; i += gl_WorkGroupSize.x) {
+        float v = input_data[i];
+        ss += v * v;
+    }
+    partial_sums[tid] = ss;
+    barrier();
+
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) partial_sums[tid] += partial_sums[tid + s];
+        barrier();
+    }
+
+    float inv_rms = 1.0 / sqrt(partial_sums[0] / float(dim) + eps);
+    barrier();
+
+    // Write normalized values to shared memory
+    for (uint i = tid; i < dim; i += gl_WorkGroupSize.x) {
+        normed[i] = input_data[i] * inv_rms * norm_weight[i];
+    }
+    barrier();
+
+    // ── Step 2: Q4_0 matmul using normed input from shared memory ──
+    uint row_byte_offset = row * blocks_per_row * 18u;
+    float sum = 0.0;
+
+    for (uint block = tid; block < blocks_per_row; block += gl_WorkGroupSize.x) {
+        uint boff = row_byte_offset + block * 18u;
+
+        // Read f16 scale
+        uint sw = boff / 4u;
+        uint sb = boff % 4u;
+        uint raw = mat_weight[sw];
+        uint f16_bits;
+        if (sb == 0u)      f16_bits = raw & 0xFFFFu;
+        else if (sb == 2u) f16_bits = (raw >> 16) & 0xFFFFu;
+        else {
+            uint next = mat_weight[sw + 1u];
+            f16_bits = ((raw >> (sb * 8u)) | (next << (32u - sb * 8u))) & 0xFFFFu;
+        }
+        float scale = unpack_f16(f16_bits);
+
+        uint qoff = boff + 2u;
+        uint col_base = block * 32u;
+
+        for (uint j = 0u; j < 16u; j++) {
+            uint bi = qoff + j;
+            uint word = mat_weight[bi / 4u];
+            uint byte_val = (word >> ((bi % 4u) * 8u)) & 0xFFu;
+
+            float q0 = float(int(byte_val & 0xFu) - 8);
+            float q1 = float(int((byte_val >> 4u) & 0xFu) - 8);
+
+            uint c0 = col_base + j * 2u;
+            // Read from SHARED MEMORY normed[] instead of global input_data[]
+            if (c0 < n_cols)      sum += scale * q0 * normed[c0];
+            if (c0 + 1u < n_cols) sum += scale * q1 * normed[c0 + 1u];
+        }
+    }
+
+    partial_sums[tid] = sum;
+    barrier();
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) partial_sums[tid] += partial_sums[tid + s];
+        barrier();
+    }
+    if (tid == 0) out_data[row] = partial_sums[0];
+}

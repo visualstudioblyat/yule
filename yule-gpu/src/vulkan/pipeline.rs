@@ -17,6 +17,8 @@ pub enum ShaderKey {
     QmvQ4K,
     QmvQ6K,
     QmvQ8_0,
+    // Fused RMSNorm + Q4_0 matmul (eliminates 1 dispatch + 1 barrier per fusion)
+    FusedRmsNormQmvQ4_0,
     // Multi-head fused attention (all heads in 1 dispatch)
     MultiheadAttn,
     // Flash-Decoding split-KV dispatch
@@ -254,6 +256,13 @@ impl PipelineManager {
                 include_bytes!("../../shaders/compiled/attn_value.spv"),
                 4,
                 20,
+            ),
+            // Fused RMSNorm + Q4_0 matmul
+            (
+                ShaderKey::FusedRmsNormQmvQ4_0,
+                include_bytes!("../../shaders/compiled/rms_norm_qmv_q4_0.spv"),
+                4,  // input, norm_weight, mat_weight, output
+                20, // dim(4) + n_rows(4) + n_cols(4) + blocks_per_row(4) + eps(4)
             ),
             (
                 ShaderKey::QmvQ4_0,
