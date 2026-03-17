@@ -53,7 +53,7 @@ layout(push_constant) uniform Params {
 shared float s_reduce[256];        // 1,024 bytes — intra-WG reduction
 shared float s_attn[2048];         // 8,192 bytes — attention scores (WG0 only)
 shared float s_temp_local[64];     // 256 bytes — query vector for attention
-shared float s_input[2048];        // 8,192 bytes — cached input vector for QMV
+shared float s_input[5632];        // 22,528 bytes — cached input vector for QMV (fits ff_dim)
 
 // ══════════════════════════════════════════════════════════════════════
 // SCRATCH BUFFER LAYOUT (global memory)
@@ -209,24 +209,16 @@ void rms_norm_global(uint norm_offset, uint src_offset, uint dst_offset, uint n_
 
     grid_sync(n_workgroups);
 
-    // Workgroup 0 reduces all partial sums and broadcasts inv_rms
-    if (wg == 0u) {
-        if (tid < n_workgroups) {
-            s_reduce[tid] = scratch[SCRATCH_PARTIALS + tid];
-        } else {
-            s_reduce[tid] = 0.0;
+    // All workgroups redundantly reduce 28 partial sums (saves 1 grid_sync)
+    float total_ss = 0.0;
+    if (tid == 0u) {
+        for (uint w = 0u; w < n_workgroups; w++) {
+            total_ss += scratch[SCRATCH_PARTIALS + w];
         }
-        barrier();
-        reduce_sum_256();
-        if (tid == 0u) {
-            scratch[SCRATCH_PARTIALS] = 1.0 / sqrt(s_reduce[0] / float(dim) + eps);
-        }
+        s_reduce[0] = 1.0 / sqrt(total_ss / float(dim) + eps);
     }
-
-    grid_sync(n_workgroups);
-
-    // All workgroups apply normalization
-    float inv_rms = scratch[SCRATCH_PARTIALS];
+    barrier();
+    float inv_rms = s_reduce[0];
     for (uint i = global_tid; i < dim; i += total_threads) {
         scratch[dst_offset + i] = scratch[src_offset + i] * inv_rms * norm_weights[norm_offset + i];
     }
@@ -335,74 +327,18 @@ void qmv_q4_0_global(
     uint global_tid = wg * 256u + tid;
     uint total_threads = n_workgroups * 256u;
 
-    // Cache input vector in shared memory (dim <= 2048)
-    if (n_cols <= 2048u) {
-        for (uint i = tid; i < n_cols; i += 256u) {
-            s_input[i] = scratch[input_offset + i];
-        }
-        barrier();
+    // Cache input vector in shared memory (s_input fits up to 5632 = ff_dim)
+    for (uint i = tid; i < n_cols; i += 256u) {
+        s_input[i] = scratch[input_offset + i];
     }
+    barrier();
 
     uint tensor_base = weight_word_offset * 4u;
     uint row_stride = bpr * 18u;
 
-    if (n_cols <= 2048u) {
-        // Fast path: input in shared memory, no branches in hot loop
-        for (uint row = global_tid; row < n_rows; row += total_threads) {
-            scratch[output_offset + row] = qmv_row_shared(tensor_base + row * row_stride, bpr);
-        }
-    } else {
-        // Fallback: input from global scratch (for ff_dim > 2048)
-        // Same block-pair unrolling with hardcoded alignment
-        for (uint row = global_tid; row < n_rows; row += total_threads) {
-            uint rb = tensor_base + row * row_stride;
-            float sum = 0.0;
-            uint pc = bpr >> 1u;
-            for (uint bp = 0u; bp < pc; bp++) {
-                uint bb_e = rb + bp * 36u;
-                vec2 sc = unpackHalf2x16(weight_data[bb_e >> 2u]);
-                // Even block (qs=16)
-                uint qw_e = (bb_e + 2u) >> 2u;
-                uint cb_e = bp * 64u;
-                for (uint w = 0u; w < 4u; w++) {
-                    uint d0 = weight_data[qw_e+w]; uint d1 = weight_data[qw_e+w+1u];
-                    uint qd = (d0 >> 16u) | (d1 << 16u);
-                    uint c = cb_e + w*8u;
-                    sum += sc.x * (
-                        float(int((qd      )&0xFu)-8)*scratch[input_offset+c]    +float(int((qd>> 4u)&0xFu)-8)*scratch[input_offset+c+1u]+
-                        float(int((qd>> 8u)&0xFu)-8)*scratch[input_offset+c+2u]+float(int((qd>>12u)&0xFu)-8)*scratch[input_offset+c+3u]+
-                        float(int((qd>>16u)&0xFu)-8)*scratch[input_offset+c+4u]+float(int((qd>>20u)&0xFu)-8)*scratch[input_offset+c+5u]+
-                        float(int((qd>>24u)&0xFu)-8)*scratch[input_offset+c+6u]+float(int((qd>>28u)&0xFu)-8)*scratch[input_offset+c+7u]);
-                }
-                // Odd block (qs=0)
-                uint qw_o = (bb_e + 20u) >> 2u;
-                uint cb_o = cb_e + 32u;
-                for (uint w = 0u; w < 4u; w++) {
-                    uint qd = weight_data[qw_o+w];
-                    uint c = cb_o + w*8u;
-                    sum += sc.y * (
-                        float(int((qd      )&0xFu)-8)*scratch[input_offset+c]    +float(int((qd>> 4u)&0xFu)-8)*scratch[input_offset+c+1u]+
-                        float(int((qd>> 8u)&0xFu)-8)*scratch[input_offset+c+2u]+float(int((qd>>12u)&0xFu)-8)*scratch[input_offset+c+3u]+
-                        float(int((qd>>16u)&0xFu)-8)*scratch[input_offset+c+4u]+float(int((qd>>20u)&0xFu)-8)*scratch[input_offset+c+5u]+
-                        float(int((qd>>24u)&0xFu)-8)*scratch[input_offset+c+6u]+float(int((qd>>28u)&0xFu)-8)*scratch[input_offset+c+7u]);
-                }
-            }
-            if ((bpr & 1u) != 0u) {
-                uint bb = rb + (bpr-1u)*18u;
-                float scale = unpackHalf2x16(weight_data[bb>>2u]).x;
-                uint qw = (bb+2u)>>2u; uint cb = (bpr-1u)*32u;
-                for (uint w = 0u; w < 4u; w++) {
-                    uint d0=weight_data[qw+w]; uint d1=weight_data[qw+w+1u];
-                    uint qd=(d0>>16u)|(d1<<16u); uint c=cb+w*8u;
-                    sum += scale*(
-                        float(int((qd      )&0xFu)-8)*scratch[input_offset+c]    +float(int((qd>> 4u)&0xFu)-8)*scratch[input_offset+c+1u]+
-                        float(int((qd>> 8u)&0xFu)-8)*scratch[input_offset+c+2u]+float(int((qd>>12u)&0xFu)-8)*scratch[input_offset+c+3u]+
-                        float(int((qd>>16u)&0xFu)-8)*scratch[input_offset+c+4u]+float(int((qd>>20u)&0xFu)-8)*scratch[input_offset+c+5u]+
-                        float(int((qd>>24u)&0xFu)-8)*scratch[input_offset+c+6u]+float(int((qd>>28u)&0xFu)-8)*scratch[input_offset+c+7u]);
-                }
-            }
-            scratch[output_offset + row] = sum;
-        }
+    // Always use branchless shared-memory path
+    for (uint row = global_tid; row < n_rows; row += total_threads) {
+        scratch[output_offset + row] = qmv_row_shared(tensor_base + row * row_stride, bpr);
     }
 
     grid_sync(n_workgroups);
@@ -679,15 +615,18 @@ void main() {
         grid_sync(n_wgs);
 
         // ── RoPE + KV cache write (fused — independent data) ──────
+        // Optimized: replace pow() with exp2(log2(base)*exp) — 3 ops vs ~20
         {
-            float freq_base = uintBitsToFloat(rope_freq_base_bits);
+            float log2_base = log2(uintBitsToFloat(rope_freq_base_bits));
             uint half_hd = head_dim / 2u;
+            float inv_hd = 1.0 / float(head_dim);
+
             uint total_q_pairs = n_heads * half_hd;
             for (uint idx = global_tid; idx < total_q_pairs; idx += total_threads) {
                 uint pair = idx % half_hd;
                 uint head = idx / half_hd;
                 uint base_off = SCRATCH_Q + head * head_dim;
-                float freq = 1.0 / pow(freq_base, float(2u * pair) / float(head_dim));
+                float freq = exp2(-log2_base * float(2u * pair) * inv_hd);
                 float angle = float(pos) * freq;
                 float cos_a = cos(angle); float sin_a = sin(angle);
                 float q0 = scratch[base_off + 2u * pair];
@@ -700,7 +639,7 @@ void main() {
                 uint pair = idx % half_hd;
                 uint head = idx / half_hd;
                 uint base_off = SCRATCH_K + head * head_dim;
-                float freq = 1.0 / pow(freq_base, float(2u * pair) / float(head_dim));
+                float freq = exp2(-log2_base * float(2u * pair) * inv_hd);
                 float angle = float(pos) * freq;
                 float cos_a = cos(angle); float sin_a = sin(angle);
                 float k0 = scratch[base_off + 2u * pair];
@@ -770,11 +709,13 @@ void main() {
         }
         grid_sync(n_wgs);
 
-        // ── SwiGLU (no separate function, inline) ──────────────────
+        // ── SwiGLU (inline, fused with down projection input load) ──
+        // SiLU(g) * up = g * sigmoid(g) * up
+        // Write result to both SCRATCH_GATE and s_input for down projection
         for (uint i = global_tid; i < ff_dim; i += total_threads) {
             float g = scratch[SCRATCH_GATE + i];
-            float silu_g = g / (1.0 + exp(-g));
-            scratch[SCRATCH_GATE + i] = silu_g * scratch[SCRATCH_UP + i];
+            float result = (g / (1.0 + exp(-g))) * scratch[SCRATCH_UP + i];
+            scratch[SCRATCH_GATE + i] = result;
         }
         grid_sync(n_wgs);
 
@@ -796,19 +737,13 @@ void main() {
     // FINAL: Output norm + LM head projection
     // ════════════════════════════════════════════════════════════════
 
-    // ── Final RMSNorm (in-place: HIDDEN -> HIDDEN) ──────────────────
-    // Need in-place norm — write to TEMP then copy back
+    // ── Final RMSNorm: HIDDEN -> TEMP ──────────────────────────────
     rms_norm_global(get_output_norm_offset(), SCRATCH_HIDDEN, SCRATCH_TEMP, n_wgs);
-    // Copy TEMP -> HIDDEN for the output projection
-    for (uint i = global_tid; i < dim; i += total_threads) {
-        scratch[SCRATCH_HIDDEN + i] = scratch[SCRATCH_TEMP + i];
-    }
-    grid_sync(n_wgs);
 
-    // ── Output projection: HIDDEN -> output_logits ──────────────────
-    // Cache hidden state in shared memory for fast reads
+    // ── Output projection: TEMP -> output_logits ────────────────────
+    // Load normed result directly into shared memory (skip TEMP→HIDDEN copy)
     for (uint i = tid; i < dim; i += 256u) {
-        s_input[i] = scratch[SCRATCH_HIDDEN + i];
+        s_input[i] = scratch[SCRATCH_TEMP + i];
     }
     barrier();
 
