@@ -17,6 +17,8 @@ pub enum ShaderKey {
     QmvQ4K,
     QmvQ6K,
     QmvQ8_0,
+    // Multi-head fused attention (all heads in 1 dispatch)
+    MultiheadAttn,
     // Flash-Decoding split-KV dispatch
     FlashDecodeSplit,
     FlashDecodeReduce,
@@ -276,6 +278,13 @@ impl PipelineManager {
                 include_bytes!("../../shaders/compiled/qmv_q8_0.spv"),
                 3,
                 12,
+            ),
+            // Multi-head fused attention: all heads in 1 dispatch
+            (
+                ShaderKey::MultiheadAttn,
+                include_bytes!("../../shaders/compiled/multihead_attn.spv"),
+                4,  // query, key_cache, value_cache, attn_out
+                20, // head_dim(4) + seq_len(4) + n_heads(4) + n_kv_heads(4) + kv_stride(4)
             ),
             // Flash-Decoding: split KV cache across workgroups for parallel decode
             (

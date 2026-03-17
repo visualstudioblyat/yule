@@ -1,0 +1,104 @@
+#version 450
+
+// Multi-head fused attention: ALL heads in ONE dispatch.
+// Replaces 96 per-head dispatches (32 heads × 3 ops) with 1 dispatch.
+// Each workgroup handles one head. 32 workgroups = 32 heads.
+//
+// Per workgroup:
+//   1. Compute Q · K_cache scores for all positions
+//   2. Softmax over scores
+//   3. Weighted sum of V_cache
+// All in shared memory, no global memory barriers between steps.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Query { float query[]; };
+layout(set = 0, binding = 1) buffer KeyCache { float key_cache[]; };
+layout(set = 0, binding = 2) buffer ValueCache { float value_cache[]; };
+layout(set = 0, binding = 3) buffer Output { float attn_out[]; };
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint seq_len;
+    uint n_heads;
+    uint n_kv_heads;
+    uint kv_stride;    // total elements per position in KV cache
+};
+
+shared float scores[4096];  // max seq_len we support in shared memory
+shared float partial[256];  // for reductions
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    if (head >= n_heads) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_group = n_heads / n_kv_heads;
+    uint kv_head = head / kv_group;
+    uint head_offset = head * head_dim;
+    uint kv_offset = kv_head * head_dim;
+    float scale = 1.0 / sqrt(float(head_dim));
+
+    // Clamp seq_len to shared memory capacity
+    uint effective_seq = min(seq_len, 4096u);
+
+    // ── Step 1: Compute attention scores ──
+    // Each thread handles multiple positions
+    for (uint pos = tid; pos < effective_seq; pos += gl_WorkGroupSize.x) {
+        float dot = 0.0;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += query[head_offset + d] * key_cache[pos * kv_stride + kv_offset + d];
+        }
+        scores[pos] = dot * scale;
+    }
+    barrier();
+
+    // ── Step 2: Softmax ──
+    // 2a: Find max (parallel reduction)
+    float local_max = -1.0e30;
+    for (uint pos = tid; pos < effective_seq; pos += gl_WorkGroupSize.x) {
+        local_max = max(local_max, scores[pos]);
+    }
+    partial[tid] = local_max;
+    barrier();
+
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) partial[tid] = max(partial[tid], partial[tid + s]);
+        barrier();
+    }
+    float max_score = partial[0];
+    barrier();
+
+    // 2b: Exp and sum
+    float local_sum = 0.0;
+    for (uint pos = tid; pos < effective_seq; pos += gl_WorkGroupSize.x) {
+        float e = exp(scores[pos] - max_score);
+        scores[pos] = e;
+        local_sum += e;
+    }
+    partial[tid] = local_sum;
+    barrier();
+
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) partial[tid] += partial[tid + s];
+        barrier();
+    }
+    float inv_sum = 1.0 / partial[0];
+    barrier();
+
+    // 2c: Normalize
+    for (uint pos = tid; pos < effective_seq; pos += gl_WorkGroupSize.x) {
+        scores[pos] *= inv_sum;
+    }
+    barrier();
+
+    // ── Step 3: Weighted value sum ──
+    // Each thread computes one or more output dimensions
+    for (uint d = tid; d < head_dim; d += gl_WorkGroupSize.x) {
+        float sum = 0.0;
+        for (uint pos = 0; pos < effective_seq; pos++) {
+            sum += scores[pos] * value_cache[pos * kv_stride + kv_offset + d];
+        }
+        attn_out[head_offset + d] = sum;
+    }
+}
