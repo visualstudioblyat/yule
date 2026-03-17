@@ -10,6 +10,7 @@ pub mod gguf;
 pub mod kernels;
 pub mod mmap;
 pub mod model;
+pub mod rank;
 pub mod safetensors;
 pub mod simd;
 pub mod tensor;
