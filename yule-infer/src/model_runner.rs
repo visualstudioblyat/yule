@@ -140,6 +140,9 @@ fn prefetch_next_block(
 ) {
 }
 
+/// Minimum rows to justify spawning threads (avoid overhead for small matmuls)
+const QMV_PARALLEL_THRESHOLD: usize = 128;
+
 fn qmv(weight_info: &TensorInfo, weight_data: &[u8], input: &[f32], out: &mut [f32]) -> Result<()> {
     let dtype = weight_info.dtype;
     let block_size = dtype.block_size();
@@ -148,34 +151,88 @@ fn qmv(weight_info: &TensorInfo, weight_data: &[u8], input: &[f32], out: &mut [f
     let n_cols = input.len();
     let blocks_per_row = n_cols / block_size;
 
-    for row in 0..n_rows {
-        let mut sum = 0.0f32;
-        let row_offset = row * blocks_per_row * block_bytes;
-        for b in 0..blocks_per_row {
-            let block_start = row_offset + b * block_bytes;
-            let block = &weight_data[block_start..block_start + block_bytes];
-            let act_start = b * block_size;
-            let act = &input[act_start..act_start + block_size];
+    let n_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
 
-            // prefetch next weight block into L1 while computing current dot
-            prefetch_next_block(
-                weight_data,
-                block_start,
-                row_offset,
-                row,
-                b,
-                blocks_per_row,
-                block_bytes,
-                n_rows,
-            );
+    if n_rows >= QMV_PARALLEL_THRESHOLD && n_threads > 1 {
+        // Parallel: partition rows across threads
+        std::thread::scope(|s| {
+            let chunk_size = n_rows.div_ceil(n_threads);
+            let mut handles = Vec::new();
+            let mut row_start = 0usize;
 
-            sum += dequant::vec_dot_block(dtype, block, act).unwrap_or_else(|_| {
-                let mut tmp = vec![0.0f32; block_size];
-                let _ = dequant::dequant_block(dtype, block, &mut tmp);
-                tmp.iter().zip(act.iter()).map(|(w, a)| w * a).sum::<f32>()
-            });
+            for chunk in out.chunks_mut(chunk_size) {
+                let my_row_start = row_start;
+                row_start += chunk.len();
+
+                handles.push(s.spawn(move || {
+                    for (i, val) in chunk.iter_mut().enumerate() {
+                        let row = my_row_start + i;
+                        let mut sum = 0.0f32;
+                        let row_offset = row * blocks_per_row * block_bytes;
+                        for b in 0..blocks_per_row {
+                            let block_start = row_offset + b * block_bytes;
+                            let block = &weight_data[block_start..block_start + block_bytes];
+                            let act_start = b * block_size;
+                            let act = &input[act_start..act_start + block_size];
+
+                            prefetch_next_block(
+                                weight_data,
+                                block_start,
+                                row_offset,
+                                row,
+                                b,
+                                blocks_per_row,
+                                block_bytes,
+                                n_rows,
+                            );
+
+                            sum += dequant::vec_dot_block(dtype, block, act).unwrap_or_else(|_| {
+                                let mut tmp = vec![0.0f32; block_size];
+                                let _ = dequant::dequant_block(dtype, block, &mut tmp);
+                                tmp.iter().zip(act.iter()).map(|(w, a)| w * a).sum::<f32>()
+                            });
+                        }
+                        *val = sum;
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+    } else {
+        // Sequential: small matmul or single-core system
+        for row in 0..n_rows {
+            let mut sum = 0.0f32;
+            let row_offset = row * blocks_per_row * block_bytes;
+            for b in 0..blocks_per_row {
+                let block_start = row_offset + b * block_bytes;
+                let block = &weight_data[block_start..block_start + block_bytes];
+                let act_start = b * block_size;
+                let act = &input[act_start..act_start + block_size];
+
+                prefetch_next_block(
+                    weight_data,
+                    block_start,
+                    row_offset,
+                    row,
+                    b,
+                    blocks_per_row,
+                    block_bytes,
+                    n_rows,
+                );
+
+                sum += dequant::vec_dot_block(dtype, block, act).unwrap_or_else(|_| {
+                    let mut tmp = vec![0.0f32; block_size];
+                    let _ = dequant::dequant_block(dtype, block, &mut tmp);
+                    tmp.iter().zip(act.iter()).map(|(w, a)| w * a).sum::<f32>()
+                });
+            }
+            out[row] = sum;
         }
-        out[row] = sum;
     }
     Ok(())
 }
