@@ -1,5 +1,7 @@
 #![allow(clippy::needless_range_loop)]
+use crate::dynamic_quant::{DynamicQuantController, LayerPrecision};
 use crate::kv_cache::StreamingKvCache;
+use crate::mixture_of_depths::{MoDConfig, MoDStats, activation_norm, should_skip_layer};
 use crate::weight_loader::TransformerWeights;
 use yule_core::dequant;
 use yule_core::dtype::DType;
@@ -45,6 +47,8 @@ struct RunnerConfig {
     n_experts: u32,
     n_experts_used: u32,
     streaming_mode: bool,
+    mod_enabled: bool,
+    dyn_quant_enabled: bool,
 }
 
 struct ScratchBuffers {
@@ -364,6 +368,9 @@ pub struct TransformerRunner<'a> {
     v_cache: Vec<Vec<f32>>,
     streaming_cache: Option<StreamingKvCache>,
     entropy_tracker: LayerEntropyTracker,
+    mod_config: MoDConfig,
+    mod_stats: MoDStats,
+    dyn_quant: Option<DynamicQuantController>,
     pos: usize,
     hidden: Vec<f32>,
     residual: Vec<f32>,
@@ -453,6 +460,8 @@ impl<'a> TransformerRunner<'a> {
             n_experts,
             n_experts_used,
             streaming_mode: max_seq_len >= 8192,
+            mod_enabled: n_layers >= 32,
+            dyn_quant_enabled: false,
         };
 
         let streaming_cache = if cfg.streaming_mode {
@@ -494,6 +503,14 @@ impl<'a> TransformerRunner<'a> {
 
         let entropy_tracker = LayerEntropyTracker::new(n_layers);
 
+        let mod_config = MoDConfig::default();
+        let mod_stats = MoDStats::new(n_layers);
+        let dyn_quant = if cfg.dyn_quant_enabled {
+            Some(DynamicQuantController::new(n_layers))
+        } else {
+            None
+        };
+
         Ok(Self {
             cfg,
             arch,
@@ -502,6 +519,9 @@ impl<'a> TransformerRunner<'a> {
             v_cache,
             streaming_cache,
             entropy_tracker,
+            mod_config,
+            mod_stats,
+            dyn_quant,
             pos: 0,
             hidden: vec![0.0; dim],
             residual: vec![0.0; dim],
@@ -561,8 +581,41 @@ impl<'a> TransformerRunner<'a> {
         let kv_stride = n_kv_heads * hd;
         let seq_len = pos + 1;
 
+        if self.cfg.mod_enabled {
+            self.mod_stats.new_token();
+        }
+        if let Some(ref mut dqc) = self.dyn_quant {
+            dqc.new_token();
+        }
+
         for layer in 0..self.cfg.n_layers {
             self.residual.copy_from_slice(&self.hidden);
+
+            // Mixture-of-Depths: skip layer if activation norm is low
+            if self.cfg.mod_enabled {
+                let norm = activation_norm(&self.hidden);
+                let layers_skipped = self
+                    .mod_stats
+                    .layers_computed
+                    .iter()
+                    .take(layer)
+                    .filter(|&&c| !c)
+                    .count();
+
+                if should_skip_layer(
+                    &self.mod_config,
+                    &self.hidden,
+                    layer,
+                    self.cfg.n_layers,
+                    self.mod_stats.total_tokens,
+                    layers_skipped,
+                ) {
+                    self.mod_stats.record(layer, false, norm);
+                    // Skip: residual pass-through (hidden is already = residual)
+                    continue;
+                }
+                self.mod_stats.record(layer, true, norm);
+            }
 
             // attention norm
             let (norm_info, norm_data) = self.weights.attn_norm(layer as u32)?;
@@ -728,6 +781,18 @@ impl<'a> TransformerRunner<'a> {
             // residual
             for i in 0..dim {
                 self.hidden[i] = self.residual[i] + self.scratch.attn_proj[i];
+            }
+
+            // Dynamic quant: conditionally skip FFN
+            let skip_ffn = self.dyn_quant.as_mut().map_or(false, |dqc| {
+                let norm = activation_norm(&self.hidden);
+                dqc.update(layer, norm as f64);
+                dqc.precision(layer) == LayerPrecision::Skip
+            });
+
+            if skip_ffn {
+                // Skip FFN entirely — keep attention output + residual as hidden state
+                continue;
             }
 
             // FFN
@@ -990,6 +1055,15 @@ impl<'a> TransformerRunner<'a> {
     /// Returns whether this runner is using streaming KV cache mode.
     pub fn is_streaming_mode(&self) -> bool {
         self.streaming_cache.is_some()
+    }
+
+    /// Returns Mixture-of-Depths statistics if MoD is enabled.
+    pub fn mod_stats(&self) -> Option<&MoDStats> {
+        if self.cfg.mod_enabled {
+            Some(&self.mod_stats)
+        } else {
+            None
+        }
     }
 }
 
