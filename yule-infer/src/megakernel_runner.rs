@@ -421,6 +421,32 @@ impl<'a> MegakernelRunner<'a> {
         self.backend
             .copy_from_device(&self.output_buf, bytemuck::cast_slice_mut(&mut logits_cpu))?;
 
+        // Debug: inspect logit distribution
+        let max_val = logits_cpu.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_val = logits_cpu.iter().cloned().fold(f32::INFINITY, f32::min);
+        let argmax = logits_cpu
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let non_zero = logits_cpu.iter().filter(|&&v| v != 0.0).count();
+        let nan_count = logits_cpu.iter().filter(|v| v.is_nan()).count();
+        eprintln!(
+            "megakernel logits: min={:.4} max={:.4} argmax={} non_zero={}/{} nan={} first5=[{:.4},{:.4},{:.4},{:.4},{:.4}]",
+            min_val,
+            max_val,
+            argmax,
+            non_zero,
+            logits_cpu.len(),
+            nan_count,
+            logits_cpu[0],
+            logits_cpu[1],
+            logits_cpu[2],
+            logits_cpu[3],
+            logits_cpu[4]
+        );
+
         self.pos += 1;
         Ok(logits_cpu)
     }
