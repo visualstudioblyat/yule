@@ -1,0 +1,112 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// Multi-head fused attention v2: subgroup operations for barrier-free reductions.
+//
+// v1 used 8 barriers for softmax. v2 uses subgroup reductions (warp-level ops)
+// which execute in a single cycle with NO barrier. On NVIDIA, subgroup = warp = 32 threads.
+//
+// Two-level reduction: subgroup first (free), then shared memory across subgroups (1 barrier).
+// With 256 threads = 8 subgroups, we need 1 barrier instead of 8.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Query { float query[]; };
+layout(set = 0, binding = 1) buffer KeyCache { float key_cache[]; };
+layout(set = 0, binding = 2) buffer ValueCache { float value_cache[]; };
+layout(set = 0, binding = 3) buffer Output { float attn_out[]; };
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint seq_len;
+    uint n_heads;
+    uint n_kv_heads;
+    uint kv_stride;
+};
+
+shared float scores[4096];
+shared float subgroup_results[8]; // max 256/32 = 8 subgroups
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    if (head >= n_heads) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_group = n_heads / n_kv_heads;
+    uint kv_head = head / kv_group;
+    uint head_offset = head * head_dim;
+    uint kv_offset = kv_head * head_dim;
+    float scale = 1.0 / sqrt(float(head_dim));
+
+    uint effective_seq = min(seq_len, 4096u);
+    uint sg_id = gl_SubgroupInvocationID;
+    uint sg_idx = gl_SubgroupID;
+    uint num_subgroups = gl_NumSubgroups;
+
+    // ── Step 1: Compute attention scores ──
+    for (uint pos = tid; pos < effective_seq; pos += gl_WorkGroupSize.x) {
+        float dot = 0.0;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += query[head_offset + d] * key_cache[pos * kv_stride + kv_offset + d];
+        }
+        scores[pos] = dot * scale;
+    }
+    barrier();
+
+    // ── Step 2: Softmax with subgroup reductions ──
+
+    // 2a: Find max — subgroup reduction first (FREE, no barrier)
+    float local_max = -1.0e30;
+    for (uint pos = tid; pos < effective_seq; pos += gl_WorkGroupSize.x) {
+        local_max = max(local_max, scores[pos]);
+    }
+    float sg_max = subgroupMax(local_max); // warp-level max, single cycle
+
+    // Cross-subgroup max via shared memory (1 barrier)
+    if (sg_id == 0) {
+        subgroup_results[sg_idx] = sg_max;
+    }
+    barrier();
+
+    float max_score = subgroup_results[0];
+    for (uint i = 1; i < num_subgroups; i++) {
+        max_score = max(max_score, subgroup_results[i]);
+    }
+
+    // 2b: Exp and sum — subgroup reduction (FREE)
+    float local_sum = 0.0;
+    for (uint pos = tid; pos < effective_seq; pos += gl_WorkGroupSize.x) {
+        float e = exp(scores[pos] - max_score);
+        scores[pos] = e;
+        local_sum += e;
+    }
+    float sg_sum = subgroupAdd(local_sum); // warp-level sum, single cycle
+
+    // Cross-subgroup sum (reuse shared memory, 1 barrier)
+    if (sg_id == 0) {
+        subgroup_results[sg_idx] = sg_sum;
+    }
+    barrier();
+
+    float total_sum = 0.0;
+    for (uint i = 0; i < num_subgroups; i++) {
+        total_sum += subgroup_results[i];
+    }
+    float inv_sum = 1.0 / total_sum;
+
+    // 2c: Normalize
+    for (uint pos = tid; pos < effective_seq; pos += gl_WorkGroupSize.x) {
+        scores[pos] *= inv_sum;
+    }
+    barrier();
+
+    // ── Step 3: Weighted value sum ──
+    for (uint d = tid; d < head_dim; d += gl_WorkGroupSize.x) {
+        float sum = 0.0;
+        for (uint pos = 0; pos < effective_seq; pos++) {
+            sum += scores[pos] * value_cache[pos * kv_stride + kv_offset + d];
+        }
+        attn_out[head_offset + d] = sum;
+    }
+}
