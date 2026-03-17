@@ -24,6 +24,8 @@ pub enum ShaderKey {
     // Flash-Decoding split-KV dispatch
     FlashDecodeSplit,
     FlashDecodeReduce,
+    // Megakernel: entire transformer layer in one dispatch
+    Megakernel,
     // Cooperative matrix variants (VK_KHR_cooperative_matrix)
     CoopMatmul,
     CoopQmvQ4_0,
@@ -307,6 +309,13 @@ impl PipelineManager {
                 include_bytes!("../../shaders/compiled/flash_decode_reduce.spv"),
                 4,  // partial_out, partial_lse, partial_max, final_out
                 12, // head_dim(4) + num_splits(4) + out_offset(4)
+            ),
+            // Megakernel: entire forward pass in one dispatch
+            (
+                ShaderKey::Megakernel,
+                include_bytes!("../../shaders/compiled/megakernel.spv"),
+                8,  // weights, offsets, k_cache, v_cache, scratch, input, output, norm_weights
+                56, // 14 uint fields × 4 bytes
             ),
         ];
 

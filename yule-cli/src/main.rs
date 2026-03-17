@@ -619,7 +619,19 @@ fn cmd_run(
             runner = Box::new(yule_infer::rwkv::RwkvRunner::new(&weights.store)?);
         }
         _ => {
-            if use_vulkan {
+            if backend == "megakernel" {
+                #[cfg(feature = "vulkan")]
+                {
+                    eprintln!("backend: megakernel (single-dispatch Vulkan)");
+                    runner = Box::new(yule_infer::megakernel_runner::MegakernelRunner::new(
+                        weights,
+                    )?);
+                }
+                #[cfg(not(feature = "vulkan"))]
+                {
+                    return Err("megakernel requires vulkan feature".into());
+                }
+            } else if use_vulkan {
                 #[cfg(feature = "vulkan")]
                 {
                     eprintln!("backend: vulkan");

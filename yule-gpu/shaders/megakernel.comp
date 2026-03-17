@@ -1,0 +1,791 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// ══════════════════════════════════════════════════════════════════════
+// Yule Megakernel: Single-Dispatch Transformer Forward Pass
+//
+// Entire Llama-class transformer inference in one compute dispatch.
+// Single workgroup of 256 threads processes embedding -> logits.
+// All inter-operation synchronization via barrier() on shared memory.
+// ══════════════════════════════════════════════════════════════════════
+
+// Single workgroup, 256 threads (8 warps)
+layout(local_size_x = 256) in;
+
+// ══════════════════════════════════════════════════════════════════════
+// DESCRIPTOR SET 0: Everything the megakernel needs
+// ══════════════════════════════════════════════════════════════════════
+
+// Binding 0: All quantized weights packed contiguously (~564MB)
+layout(set = 0, binding = 0) buffer Weights { uint weight_data[]; };
+
+// Binding 1: Offset table — for each layer, uint word offsets to each tensor
+// Layout: [layer * 9 + tensor_id] = uint offset into weight_data[]
+// tensor_id: 0=attn_norm, 1=attn_q, 2=attn_k, 3=attn_v,
+//            4=attn_output, 5=ffn_norm, 6=ffn_gate, 7=ffn_up, 8=ffn_down
+// Plus: [n_layers*9 + 0] = output_norm offset (unused, norms in separate buffer)
+//       [n_layers*9 + 1] = output_weight offset
+layout(set = 0, binding = 1) buffer Offsets { uint offsets[]; };
+
+// Binding 2: K cache — packed [layer][position][n_kv_heads * head_dim]
+layout(set = 0, binding = 2) buffer KCache { float k_cache[]; };
+
+// Binding 3: V cache — packed [layer][position][n_kv_heads * head_dim]
+layout(set = 0, binding = 3) buffer VCache { float v_cache[]; };
+
+// Binding 4: Scratch buffers for intermediate activations (global memory)
+layout(set = 0, binding = 4) buffer Scratch { float scratch[]; };
+
+// Binding 5: Input embedding vector (host writes before dispatch)
+layout(set = 0, binding = 5) buffer Input { float input_embedding[]; };
+
+// Binding 6: Output logits (host reads after dispatch completes)
+layout(set = 0, binding = 6) buffer Output { float output_logits[]; };
+
+// Binding 7: Norm weights stored as f32
+// Packed: [layer * 2 + norm_type] * dim, where norm_type 0=attn_norm, 1=ffn_norm
+// Plus: [n_layers * 2] * dim = output_norm
+layout(set = 0, binding = 7) buffer NormWeights { float norm_weights[]; };
+
+// ══════════════════════════════════════════════════════════════════════
+// PUSH CONSTANTS (56 bytes, well within 128-byte Vulkan minimum)
+// ══════════════════════════════════════════════════════════════════════
+
+layout(push_constant) uniform Params {
+    uint pos;                   // current sequence position
+    uint n_layers;              // number of transformer layers
+    uint dim;                   // hidden dimension
+    uint n_heads;               // query head count
+    uint n_kv_heads;            // KV head count (GQA)
+    uint head_dim;              // per-head dimension (dim / n_heads)
+    uint ff_dim;                // FFN intermediate dimension
+    uint vocab_size;            // output vocabulary size
+    uint max_seq_len;           // maximum sequence length
+    uint norm_eps_bits;         // RMSNorm epsilon as uint bits
+    uint rope_freq_base_bits;   // RoPE frequency base as uint bits
+    uint blocks_per_row_dim;    // Q4_0 blocks per row for dim-width matrices
+    uint blocks_per_row_ff;     // Q4_0 blocks per row for ff_dim-width matrices
+    uint blocks_per_row_kv;     // Q4_0 blocks per row for kv projection matrices
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// SHARED MEMORY: 33KB of 48KB budget
+// ══════════════════════════════════════════════════════════════════════
+
+// Primary activation vector — always resident
+shared float s_hidden[2048];       // 8,192 bytes
+
+// Residual vector — saved at start of each layer
+shared float s_residual[2048];     // 8,192 bytes
+
+// Reduction scratch for parallel sum/max
+shared float s_reduce[256];        // 1,024 bytes
+
+// Attention scores (reused as temp in other phases)
+shared float s_attn[2048];         // 8,192 bytes (max seq_len positions)
+
+// Temp vector for intermediate results
+shared float s_temp[2048];         // 8,192 bytes
+
+// Total: 33,792 bytes = 33KB — well within 48KB budget
+
+// ══════════════════════════════════════════════════════════════════════
+// SCRATCH BUFFER LAYOUT (global memory, float offsets)
+// ══════════════════════════════════════════════════════════════════════
+
+// Q projection output:  n_heads * head_dim = 2048 floats
+#define SCRATCH_Q         0
+// K projection output:  n_kv_heads * head_dim = 256 floats
+#define SCRATCH_K         2048
+// V projection output:  n_kv_heads * head_dim = 256 floats
+#define SCRATCH_V         2304
+// Attention output:     n_heads * head_dim = 2048 floats
+#define SCRATCH_ATTN_OUT  2560
+// Attention projection: dim = 2048 floats
+#define SCRATCH_ATTN_PROJ 4608
+// Gate output:          ff_dim = 5632 floats
+#define SCRATCH_GATE      6656
+// Up output:            ff_dim = 5632 floats
+#define SCRATCH_UP        12288
+// FFN output:           dim = 2048 floats
+#define SCRATCH_FFN_OUT   17920
+// Total scratch: ~80KB
+
+// ══════════════════════════════════════════════════════════════════════
+// UTILITY: F16 unpacking (from existing qmv_q4_0.comp)
+// ══════════════════════════════════════════════════════════════════════
+
+float unpack_f16(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) {
+        float val = ldexp(float(mant), -24);
+        return sign == 1u ? -val : val;
+    }
+    if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+    float val = ldexp(float(mant | 0x400u), int(exp) - 25);
+    return sign == 1u ? -val : val;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// UTILITY: Parallel reduction (sum) over s_reduce[0..255]
+// Result in s_reduce[0] after return.
+// ══════════════════════════════════════════════════════════════════════
+
+void reduce_sum_256() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_reduce[tid] += s_reduce[tid + s];
+        }
+        barrier();
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// UTILITY: Parallel reduction (max) over s_reduce[0..255]
+// Result in s_reduce[0] after return.
+// ══════════════════════════════════════════════════════════════════════
+
+void reduce_max_256() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + s]);
+        }
+        barrier();
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// UTILITY: Weight offset lookups
+// ══════════════════════════════════════════════════════════════════════
+
+// Returns the uint (4-byte word) offset into weight_data[] for a given tensor
+uint get_weight_offset(uint layer, uint tensor_id) {
+    uint idx = layer * 9u + tensor_id;
+    return offsets[idx]; // stored as uint offset (byte_offset / 4)
+}
+
+// Returns float offset into norm_weights[] for a given layer's norm
+uint get_norm_offset(uint layer, uint norm_type) {
+    // norm_type: 0 = attn_norm, 1 = ffn_norm
+    return (layer * 2u + norm_type) * dim;
+}
+
+// Returns float offset into norm_weights[] for the final output norm
+uint get_output_norm_offset() {
+    return n_layers * 2u * dim;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 1: RMSNorm (in-place on s_hidden)
+//
+// Reads input from s_hidden[], writes normalized result back to s_hidden[].
+// Streams norm weights from global memory (norm_weights SSBO).
+// Uses s_reduce[] for parallel sum reduction.
+// ══════════════════════════════════════════════════════════════════════
+
+void rms_norm_inplace(uint norm_offset) {
+    uint tid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(norm_eps_bits);
+
+    // Step 1: Compute sum of squares across the hidden vector
+    float ss = 0.0;
+    for (uint i = tid; i < dim; i += 256u) {
+        float v = s_hidden[i];
+        ss += v * v;
+    }
+    s_reduce[tid] = ss;
+    barrier();
+    reduce_sum_256();
+    float inv_rms = 1.0 / sqrt(s_reduce[0] / float(dim) + eps);
+    barrier();
+
+    // Step 2: Normalize and apply learned weights
+    for (uint i = tid; i < dim; i += 256u) {
+        s_hidden[i] = s_hidden[i] * inv_rms * norm_weights[norm_offset + i];
+    }
+    barrier();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 1b: RMSNorm (s_hidden -> s_temp)
+//
+// Reads input from s_hidden[], writes normalized result to s_temp[].
+// Preserves s_hidden[] for residual connection use.
+// ══════════════════════════════════════════════════════════════════════
+
+void rms_norm_to_temp(uint norm_offset) {
+    uint tid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(norm_eps_bits);
+
+    // Step 1: Compute sum of squares
+    float ss = 0.0;
+    for (uint i = tid; i < dim; i += 256u) {
+        float v = s_hidden[i];
+        ss += v * v;
+    }
+    s_reduce[tid] = ss;
+    barrier();
+    reduce_sum_256();
+    float inv_rms = 1.0 / sqrt(s_reduce[0] / float(dim) + eps);
+    barrier();
+
+    // Step 2: Write normalized result to s_temp (leaving s_hidden intact)
+    for (uint i = tid; i < dim; i += 256u) {
+        s_temp[i] = s_hidden[i] * inv_rms * norm_weights[norm_offset + i];
+    }
+    barrier();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 2: Q4_0 Quantized Matrix-Vector Product (shared mem input)
+//
+// Each thread processes multiple output rows (row = tid; row < n_rows;
+// row += 256). Input vector is read from shared memory (fast).
+// Weight blocks are streamed from global memory.
+// Output is written to global scratch buffer.
+//
+// Q4_0 block format: 2 bytes f16 scale + 16 bytes quantized data
+//                    = 18 bytes per block of 32 elements.
+// ══════════════════════════════════════════════════════════════════════
+
+void qmv_q4_0_from_shared(
+    uint weight_word_offset,  // offset into weight_data[] (in uint words)
+    uint n_rows,              // output dimension (number of rows)
+    uint n_cols,              // input dimension (matches shared mem vector)
+    uint bpr,                 // blocks per row (n_cols / 32)
+    uint output_offset,       // offset into scratch[] for output
+    bool read_from_temp       // true: read s_temp[], false: read s_hidden[]
+) {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Each thread handles rows: tid, tid+256, tid+512, ...
+    for (uint row = tid; row < n_rows; row += 256u) {
+        uint row_byte_offset = row * bpr * 18u;
+        float sum = 0.0;
+
+        // Iterate over Q4_0 blocks in this row
+        for (uint block = 0u; block < bpr; block++) {
+            uint boff = row_byte_offset + block * 18u;
+            uint abs_boff = weight_word_offset * 4u + boff;
+
+            // --- Read f16 scale (2 bytes, possibly unaligned) ---
+            uint sw = abs_boff / 4u;
+            uint sb = abs_boff % 4u;
+            uint raw = weight_data[sw];
+            uint f16_bits;
+            if (sb == 0u)      f16_bits = raw & 0xFFFFu;
+            else if (sb == 2u) f16_bits = (raw >> 16) & 0xFFFFu;
+            else {
+                uint next_raw = weight_data[sw + 1u];
+                f16_bits = ((raw >> (sb * 8u)) | (next_raw << (32u - sb * 8u))) & 0xFFFFu;
+            }
+            float scale = unpack_f16(f16_bits);
+
+            // --- Process 16 bytes of quantized data (32 elements, 4 bits each) ---
+            uint qoff = abs_boff + 2u;
+            uint col_base = block * 32u;
+
+            for (uint j = 0u; j < 16u; j++) {
+                uint bi = qoff + j;
+                uint word = weight_data[bi / 4u];
+                uint byte_val = (word >> ((bi % 4u) * 8u)) & 0xFFu;
+
+                // Low nibble and high nibble, each offset by 8 to center around 0
+                float q0 = float(int(byte_val & 0xFu) - 8);
+                float q1 = float(int((byte_val >> 4u) & 0xFu) - 8);
+
+                uint c0 = col_base + j * 2u;
+                float in0 = read_from_temp ? s_temp[c0] : s_hidden[c0];
+                float in1 = read_from_temp ? s_temp[c0 + 1u] : s_hidden[c0 + 1u];
+                if (c0 < n_cols)      sum += scale * q0 * in0;
+                if (c0 + 1u < n_cols) sum += scale * q1 * in1;
+            }
+        }
+        scratch[output_offset + row] = sum;
+    }
+    barrier();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 2b: Q4_0 MatVec reading input from global memory (scratch)
+//
+// Used for the FFN down projection where the input vector (ff_dim=5632)
+// is too large to fit in shared memory (22KB > available).
+// Same algorithm as qmv_q4_0_from_shared but reads input from scratch[].
+// ══════════════════════════════════════════════════════════════════════
+
+void qmv_q4_0_from_global(
+    uint weight_word_offset,  // offset into weight_data[] (in uint words)
+    uint n_rows,              // output dimension
+    uint n_cols,              // input dimension
+    uint bpr,                 // blocks per row
+    uint input_offset,        // offset into scratch[] for input vector
+    uint output_offset        // offset into scratch[] for output
+) {
+    uint tid = gl_LocalInvocationID.x;
+
+    for (uint row = tid; row < n_rows; row += 256u) {
+        uint row_byte_offset = row * bpr * 18u;
+        float sum = 0.0;
+
+        for (uint block = 0u; block < bpr; block++) {
+            uint boff = row_byte_offset + block * 18u;
+            uint abs_boff = weight_word_offset * 4u + boff;
+
+            // Read f16 scale
+            uint sw = abs_boff / 4u;
+            uint sb = abs_boff % 4u;
+            uint raw = weight_data[sw];
+            uint f16_bits;
+            if (sb == 0u)      f16_bits = raw & 0xFFFFu;
+            else if (sb == 2u) f16_bits = (raw >> 16) & 0xFFFFu;
+            else {
+                uint next_raw = weight_data[sw + 1u];
+                f16_bits = ((raw >> (sb * 8u)) | (next_raw << (32u - sb * 8u))) & 0xFFFFu;
+            }
+            float scale = unpack_f16(f16_bits);
+
+            // Process 16 bytes of quantized data
+            uint qoff = abs_boff + 2u;
+            uint col_base = block * 32u;
+
+            for (uint j = 0u; j < 16u; j++) {
+                uint bi = qoff + j;
+                uint word = weight_data[bi / 4u];
+                uint byte_val = (word >> ((bi % 4u) * 8u)) & 0xFFu;
+
+                float q0 = float(int(byte_val & 0xFu) - 8);
+                float q1 = float(int((byte_val >> 4u) & 0xFu) - 8);
+
+                uint c0 = col_base + j * 2u;
+                // Read from global scratch instead of shared memory
+                if (c0 < n_cols)      sum += scale * q0 * scratch[input_offset + c0];
+                if (c0 + 1u < n_cols) sum += scale * q1 * scratch[input_offset + c0 + 1u];
+            }
+        }
+        scratch[output_offset + row] = sum;
+    }
+    barrier();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 3: RoPE (Rotary Position Embeddings)
+//
+// Applied to Q and K vectors in global scratch memory.
+// Each thread handles multiple (head, pair) combinations.
+// ══════════════════════════════════════════════════════════════════════
+
+void apply_rope(uint position) {
+    uint tid = gl_LocalInvocationID.x;
+    float freq_base = uintBitsToFloat(rope_freq_base_bits);
+    uint half_dim = head_dim / 2u;
+
+    // Apply RoPE to all Q heads
+    uint total_q_pairs = n_heads * half_dim;
+    for (uint idx = tid; idx < total_q_pairs; idx += 256u) {
+        uint pair = idx % half_dim;
+        uint head = idx / half_dim;
+        uint base_off = SCRATCH_Q + head * head_dim;
+
+        float freq = 1.0 / pow(freq_base, float(2u * pair) / float(head_dim));
+        float angle = float(position) * freq;
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+
+        float q0 = scratch[base_off + 2u * pair];
+        float q1 = scratch[base_off + 2u * pair + 1u];
+        scratch[base_off + 2u * pair]      = q0 * cos_a - q1 * sin_a;
+        scratch[base_off + 2u * pair + 1u] = q0 * sin_a + q1 * cos_a;
+    }
+
+    // Apply RoPE to all K heads
+    uint total_k_pairs = n_kv_heads * half_dim;
+    for (uint idx = tid; idx < total_k_pairs; idx += 256u) {
+        uint pair = idx % half_dim;
+        uint head = idx / half_dim;
+        uint base_off = SCRATCH_K + head * head_dim;
+
+        float freq = 1.0 / pow(freq_base, float(2u * pair) / float(head_dim));
+        float angle = float(position) * freq;
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+
+        float k0 = scratch[base_off + 2u * pair];
+        float k1 = scratch[base_off + 2u * pair + 1u];
+        scratch[base_off + 2u * pair]      = k0 * cos_a - k1 * sin_a;
+        scratch[base_off + 2u * pair + 1u] = k0 * sin_a + k1 * cos_a;
+    }
+    barrier();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 4: KV Cache Write
+//
+// Copy K and V from scratch to the appropriate position in the
+// packed KV cache for this layer.
+// Layout: [layer][position][n_kv_heads * head_dim]
+// ══════════════════════════════════════════════════════════════════════
+
+void write_kv_cache(uint layer, uint position) {
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_dim = n_kv_heads * head_dim;
+
+    // Compute base offset for this layer + position
+    uint layer_stride = max_seq_len * kv_dim;
+    uint pos_offset = layer * layer_stride + position * kv_dim;
+
+    for (uint i = tid; i < kv_dim; i += 256u) {
+        k_cache[pos_offset + i] = scratch[SCRATCH_K + i];
+        v_cache[pos_offset + i] = scratch[SCRATCH_V + i];
+    }
+    // Ensure KV cache writes are visible to subsequent attention reads
+    memoryBarrierBuffer();
+    barrier();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 5: Multi-Head Attention (sequential over heads)
+//
+// For single-workgroup, we process heads one at a time.
+// Query comes from scratch, K/V from cache.
+// Scores are computed in s_attn[] shared memory.
+// Output goes to scratch[SCRATCH_ATTN_OUT].
+// ══════════════════════════════════════════════════════════════════════
+
+void attention_all_heads(uint layer, uint seq_len_val) {
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_dim = n_kv_heads * head_dim;
+    uint layer_stride = max_seq_len * kv_dim;
+    uint layer_kv_offset = layer * layer_stride;
+    uint kv_group = n_heads / n_kv_heads;
+
+    float inv_sqrt_hd = 1.0 / sqrt(float(head_dim));
+
+    // Process each query head sequentially
+    for (uint head = 0u; head < n_heads; head++) {
+        uint kv_head = head / kv_group;
+        uint q_offset = SCRATCH_Q + head * head_dim;
+        uint kv_head_offset = kv_head * head_dim;
+
+        // Load query vector for this head into s_temp[0..head_dim-1]
+        if (tid < head_dim) {
+            s_temp[tid] = scratch[q_offset + tid];
+        }
+        barrier();
+
+        // Step 1: Compute attention scores Q . K^T for all positions
+        for (uint p = tid; p < seq_len_val; p += 256u) {
+            float dot = 0.0;
+            uint k_pos_offset = layer_kv_offset + p * kv_dim + kv_head_offset;
+            for (uint d = 0u; d < head_dim; d++) {
+                dot += s_temp[d] * k_cache[k_pos_offset + d];
+            }
+            s_attn[p] = dot * inv_sqrt_hd;
+        }
+        barrier();
+
+        // Step 2: Softmax over scores
+        // 2a: Find max score for numerical stability
+        float local_max = -1.0e30;
+        for (uint p = tid; p < seq_len_val; p += 256u) {
+            local_max = max(local_max, s_attn[p]);
+        }
+        s_reduce[tid] = local_max;
+        barrier();
+        reduce_max_256();
+        float max_score = s_reduce[0];
+        barrier();
+
+        // 2b: Compute exp(score - max) and sum
+        float local_sum = 0.0;
+        for (uint p = tid; p < seq_len_val; p += 256u) {
+            float e = exp(s_attn[p] - max_score);
+            s_attn[p] = e;
+            local_sum += e;
+        }
+        s_reduce[tid] = local_sum;
+        barrier();
+        reduce_sum_256();
+        float inv_sum = 1.0 / s_reduce[0];
+        barrier();
+
+        // 2c: Normalize scores
+        for (uint p = tid; p < seq_len_val; p += 256u) {
+            s_attn[p] *= inv_sum;
+        }
+        barrier();
+
+        // Step 3: Weighted value sum — attention output for this head
+        for (uint d = tid; d < head_dim; d += 256u) {
+            float sum = 0.0;
+            for (uint p = 0u; p < seq_len_val; p++) {
+                uint v_pos_offset = layer_kv_offset + p * kv_dim + kv_head_offset;
+                sum += s_attn[p] * v_cache[v_pos_offset + d];
+            }
+            scratch[SCRATCH_ATTN_OUT + head * head_dim + d] = sum;
+        }
+        barrier();
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 6: SwiGLU Activation (SiLU * mul)
+//
+// Gate and Up outputs are in global scratch memory.
+// Computes SiLU(gate) * up in-place, result stored in scratch[GATE].
+// ══════════════════════════════════════════════════════════════════════
+
+void swiglu_activation() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint i = tid; i < ff_dim; i += 256u) {
+        float g = scratch[SCRATCH_GATE + i];
+        float silu_g = g / (1.0 + exp(-g));
+        scratch[SCRATCH_GATE + i] = silu_g * scratch[SCRATCH_UP + i];
+    }
+    barrier();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 7: Load from global scratch into s_hidden (shared memory)
+// ══════════════════════════════════════════════════════════════════════
+
+void load_to_hidden(uint global_offset, uint count) {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint i = tid; i < count; i += 256u) {
+        s_hidden[i] = scratch[global_offset + i];
+    }
+    barrier();
+}
+
+// Load input embedding from host-uploaded buffer into s_hidden
+void load_embedding_to_hidden() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint i = tid; i < dim; i += 256u) {
+        s_hidden[i] = input_embedding[i];
+    }
+    barrier();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// OPERATION 8: Residual add
+//
+// s_hidden = s_residual + scratch[scratch_offset]
+// Loads the projection result from global scratch, adds to saved
+// residual, stores in s_hidden for next operation.
+// ══════════════════════════════════════════════════════════════════════
+
+void residual_add_from_scratch(uint scratch_offset) {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint i = tid; i < dim; i += 256u) {
+        s_hidden[i] = s_residual[i] + scratch[scratch_offset + i];
+    }
+    barrier();
+}
+
+// Save current hidden state to residual buffer
+void save_residual() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint i = tid; i < dim; i += 256u) {
+        s_residual[i] = s_hidden[i];
+    }
+    barrier();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// MAIN: The entire transformer forward pass
+//
+// One dispatch. One shader invocation. Embedding to logits.
+//
+// The layer loop has dynamically uniform control flow (n_layers is a
+// push constant, uniform across all invocations), so barrier() calls
+// inside the loop are legal per the GLSL specification.
+// ══════════════════════════════════════════════════════════════════════
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint seq_len_val = pos + 1u;
+
+    // ── Step 0: Load embedding into shared memory ──────────────────
+    load_embedding_to_hidden();
+
+    // ════════════════════════════════════════════════════════════════
+    // LAYER LOOP: iterate over all transformer layers
+    // ════════════════════════════════════════════════════════════════
+
+    for (uint layer = 0u; layer < n_layers; layer++) {
+
+        // ── Save residual for attention sub-layer ──────────────────
+        save_residual();
+
+        // ── Attention RMSNorm: s_hidden -> s_temp ──────────────────
+        // Normalizes hidden state, writes to s_temp for matmul input.
+        // s_hidden is preserved (used later via s_residual).
+        rms_norm_to_temp(get_norm_offset(layer, 0u));
+
+        // ── Q Projection: s_temp -> scratch[SCRATCH_Q] ────────────
+        qmv_q4_0_from_shared(
+            get_weight_offset(layer, 1u),   // attn_q weights
+            n_heads * head_dim,             // output rows (2048)
+            dim,                            // input cols (2048)
+            blocks_per_row_dim,
+            SCRATCH_Q,
+            true                            // read from s_temp
+        );
+
+        // ── K Projection: s_temp -> scratch[SCRATCH_K] ────────────
+        qmv_q4_0_from_shared(
+            get_weight_offset(layer, 2u),   // attn_k weights
+            n_kv_heads * head_dim,          // output rows (256)
+            dim,                            // input cols (2048)
+            blocks_per_row_dim,
+            SCRATCH_K,
+            true
+        );
+
+        // ── V Projection: s_temp -> scratch[SCRATCH_V] ────────────
+        qmv_q4_0_from_shared(
+            get_weight_offset(layer, 3u),   // attn_v weights
+            n_kv_heads * head_dim,          // output rows (256)
+            dim,                            // input cols (2048)
+            blocks_per_row_dim,
+            SCRATCH_V,
+            true
+        );
+
+        // ── RoPE: apply rotary position embeddings to Q and K ─────
+        apply_rope(pos);
+
+        // ── Write KV cache for this position ──────────────────────
+        write_kv_cache(layer, pos);
+
+        // ── Multi-Head Attention (sequential over 32 heads) ───────
+        // Scores computed in s_attn shared memory.
+        // Output written to scratch[SCRATCH_ATTN_OUT].
+        attention_all_heads(layer, seq_len_val);
+
+        // ── Output Projection ─────────────────────────────────────
+        // Load attention output (2048 floats) into s_hidden for matmul
+        load_to_hidden(SCRATCH_ATTN_OUT, dim);
+
+        // attn_out -> attn_proj via output projection weights
+        qmv_q4_0_from_shared(
+            get_weight_offset(layer, 4u),   // attn_output weights
+            dim,                            // output rows (2048)
+            n_heads * head_dim,             // input cols (2048)
+            blocks_per_row_dim,
+            SCRATCH_ATTN_PROJ,
+            false                           // read from s_hidden
+        );
+
+        // ── Attention Residual: s_hidden = s_residual + attn_proj ─
+        residual_add_from_scratch(SCRATCH_ATTN_PROJ);
+
+        // ════════════════════════════════════════════════════════════
+        // FFN BLOCK
+        // ════════════════════════════════════════════════════════════
+
+        // ── Save residual for FFN sub-layer ────────────────────────
+        save_residual();
+
+        // ── FFN RMSNorm: s_hidden -> s_temp ────────────────────────
+        rms_norm_to_temp(get_norm_offset(layer, 1u));
+
+        // ── Gate Projection: s_temp -> scratch[SCRATCH_GATE] ──────
+        qmv_q4_0_from_shared(
+            get_weight_offset(layer, 6u),   // ffn_gate weights
+            ff_dim,                         // output rows (5632)
+            dim,                            // input cols (2048)
+            blocks_per_row_dim,
+            SCRATCH_GATE,
+            true                            // read from s_temp
+        );
+
+        // ── Up Projection: s_temp -> scratch[SCRATCH_UP] ──────────
+        qmv_q4_0_from_shared(
+            get_weight_offset(layer, 7u),   // ffn_up weights
+            ff_dim,                         // output rows (5632)
+            dim,                            // input cols (2048)
+            blocks_per_row_dim,
+            SCRATCH_UP,
+            true
+        );
+
+        // ── SwiGLU Activation: SiLU(gate) * up -> scratch[GATE] ───
+        swiglu_activation();
+
+        // ── Down Projection: scratch[GATE] -> scratch[FFN_OUT] ────
+        // Input is ff_dim=5632 floats — too large for shared memory
+        // (5632*4 = 22KB). Read from global scratch instead.
+        qmv_q4_0_from_global(
+            get_weight_offset(layer, 8u),   // ffn_down weights
+            dim,                            // output rows (2048)
+            ff_dim,                         // input cols (5632)
+            blocks_per_row_ff,
+            SCRATCH_GATE,                   // input source (SwiGLU result)
+            SCRATCH_FFN_OUT                 // output destination
+        );
+
+        // ── FFN Residual: s_hidden = s_residual + ffn_out ─────────
+        residual_add_from_scratch(SCRATCH_FFN_OUT);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // FINAL: Output norm + LM head projection
+    // ════════════════════════════════════════════════════════════════
+
+    // ── Final RMSNorm (in-place on s_hidden) ──────────────────────
+    rms_norm_inplace(get_output_norm_offset());
+
+    // ── Output projection: s_hidden -> output_logits ──────────────
+    // vocab_size = 32000 rows, dim = 2048 cols
+    // Each thread handles vocab_size/256 = 125 rows
+    // Output goes directly to the output SSBO (binding 6)
+    uint output_w_offset = offsets[n_layers * 9u + 1u];
+
+    for (uint row = tid; row < vocab_size; row += 256u) {
+        uint row_byte_offset = row * blocks_per_row_dim * 18u;
+        float sum = 0.0;
+
+        for (uint block = 0u; block < blocks_per_row_dim; block++) {
+            uint boff = row_byte_offset + block * 18u;
+            uint abs_boff = output_w_offset * 4u + boff;
+
+            // Read f16 scale
+            uint sw = abs_boff / 4u;
+            uint sb = abs_boff % 4u;
+            uint raw = weight_data[sw];
+            uint f16_bits;
+            if (sb == 0u)      f16_bits = raw & 0xFFFFu;
+            else if (sb == 2u) f16_bits = (raw >> 16) & 0xFFFFu;
+            else {
+                uint next_raw = weight_data[sw + 1u];
+                f16_bits = ((raw >> (sb * 8u)) | (next_raw << (32u - sb * 8u))) & 0xFFFFu;
+            }
+            float scale = unpack_f16(f16_bits);
+
+            // Process 16 bytes of quantized data
+            uint qoff = abs_boff + 2u;
+            uint col_base = block * 32u;
+
+            for (uint j = 0u; j < 16u; j++) {
+                uint bi = qoff + j;
+                uint word = weight_data[bi / 4u];
+                uint byte_val = (word >> ((bi % 4u) * 8u)) & 0xFFu;
+
+                float q0 = float(int(byte_val & 0xFu) - 8);
+                float q1 = float(int((byte_val >> 4u) & 0xFu) - 8);
+
+                uint c0 = col_base + j * 2u;
+                if (c0 < dim)      sum += scale * q0 * s_hidden[c0];
+                if (c0 + 1u < dim) sum += scale * q1 * s_hidden[c0 + 1u];
+            }
+        }
+        output_logits[row] = sum;
+    }
+    // No final barrier needed — output goes to global memory and
+    // the host waits for the dispatch to complete via fence/semaphore.
+}

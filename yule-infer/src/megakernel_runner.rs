@@ -370,25 +370,40 @@ impl<'a> MegakernelRunner<'a> {
             ((self.cfg.n_kv_heads * self.cfg.head_dim) / DType::Q4_0.block_size()) as u32, // blocks_per_row_kv
         ];
 
-        // When the megakernel shader is compiled and registered:
-        // let cmd = self.backend.begin_batch()?;
-        // self.backend.dispatch_batched(cmd, ShaderKey::Megakernel,
-        //     &[&self.packed_weights, &self.offset_table,
-        //       &self.k_cache, &self.v_cache, &self.scratch,
-        //       &self.input_buf, &self.output_buf, &self.norm_weights],
-        //     bytemuck::cast_slice(&push), 1, 1, 1)?;
-        // self.backend.submit_batch(cmd)?;
+        // 2. Single megakernel dispatch — the entire forward pass
+        use yule_gpu::vulkan::pipeline::ShaderKey;
 
-        // For now, return an error indicating the megakernel dispatch is not yet wired
-        return Err(YuleError::Inference(
-            "megakernel dispatch not yet wired — shader compilation pending".into(),
-        ));
+        self.backend.reset_descriptors()?;
+        let cmd = self.backend.begin_batch()?;
+
+        self.backend.dispatch_batched(
+            cmd,
+            ShaderKey::Megakernel,
+            &[
+                &self.packed_weights,
+                &self.offset_table,
+                &self.k_cache,
+                &self.v_cache,
+                &self.scratch,
+                &self.input_buf,
+                &self.output_buf,
+                &self.norm_weights,
+            ],
+            bytemuck::cast_slice(&_push),
+            1,
+            1,
+            1, // single workgroup
+        )?;
+
+        self.backend.submit_batch(cmd)?;
 
         // 3. Read logits from GPU
-        // let mut logits_cpu = vec![0.0f32; self.cfg.vocab_size];
-        // self.backend.copy_from_device(&self.output_buf, bytemuck::cast_slice_mut(&mut logits_cpu))?;
-        // self.pos += 1;
-        // Ok(logits_cpu)
+        let mut logits_cpu = vec![0.0f32; self.cfg.vocab_size];
+        self.backend
+            .copy_from_device(&self.output_buf, bytemuck::cast_slice_mut(&mut logits_cpu))?;
+
+        self.pos += 1;
+        Ok(logits_cpu)
     }
 }
 
