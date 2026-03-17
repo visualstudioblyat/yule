@@ -91,17 +91,18 @@ shared float s_input[2048];        // 8,192 bytes — cached input vector for QM
 // UTILITY: F16 unpacking
 // ══════════════════════════════════════════════════════════════════════
 
+// Use hardware f16 unpack — single instruction vs 10+ manual instructions.
+// unpackHalf2x16 converts a uint32 containing two f16 values into a vec2 of floats.
 float unpack_f16(uint bits) {
-    uint sign = (bits >> 15) & 1u;
-    uint exp  = (bits >> 10) & 0x1Fu;
-    uint mant = bits & 0x3FFu;
-    if (exp == 0u) {
-        float val = ldexp(float(mant), -24);
-        return sign == 1u ? -val : val;
-    }
-    if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
-    float val = ldexp(float(mant | 0x400u), int(exp) - 25);
-    return sign == 1u ? -val : val;
+    return unpackHalf2x16(bits).x;
+}
+
+// Unpack scale for a Q4_0 block. The scale word contains two f16 scales:
+// even blocks use the low halfword, odd blocks use the high halfword.
+// By using unpackHalf2x16 we get both in one instruction.
+float unpack_block_scale(uint scale_word, uint block_idx) {
+    vec2 scales = unpackHalf2x16(scale_word);
+    return ((block_idx & 1u) == 0u) ? scales.x : scales.y;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -244,6 +245,85 @@ void rms_norm_global(uint norm_offset, uint src_offset, uint dst_offset, uint n_
 // - Thread-per-row with branchless inner loop
 // ══════════════════════════════════════════════════════════════════════
 
+// Core QMV inner loop — processes one row, reads input from s_input[].
+// Block loop unrolled by 2: processes even+odd blocks together,
+// reading the scale word once for both (it contains 2 f16 scales).
+// Zero branches in the hot path.
+float qmv_row_shared(uint row_base, uint bpr) {
+    float sum = 0.0;
+    // Process blocks in pairs. Alignment is deterministic:
+    //   Even block: bb%4=0, qbyte%4=2 → shift by 16
+    //   Odd block:  bb%4=2, qbyte%4=0 → direct read
+    // Scale word at bb_even>>2 contains both scales via unpackHalf2x16.
+    uint pair_count = bpr >> 1u;
+    for (uint bp = 0u; bp < pair_count; bp++) {
+        uint bb_even = row_base + bp * 36u;  // 2 blocks × 18 bytes
+
+        // One read gets both scales
+        vec2 scales = unpackHalf2x16(weight_data[bb_even >> 2u]);
+
+        // ── Even block (quant data at byte offset 2 within word → shift 16) ──
+        uint qw_e = (bb_even + 2u) >> 2u;  // = (bb_even >> 2u) + 0 since bb_even%4=0, +2 bytes = within same word start
+        uint cb_e = bp * 64u;
+        for (uint w = 0u; w < 4u; w++) {
+            uint d0 = weight_data[qw_e + w];
+            uint d1 = weight_data[qw_e + w + 1u];
+            uint qd = (d0 >> 16u) | (d1 << 16u);  // hardcoded qs=16
+            uint c = cb_e + w * 8u;
+            sum += scales.x * (
+                float(int((qd      ) & 0xFu) - 8) * s_input[c]      +
+                float(int((qd >>  4u) & 0xFu) - 8) * s_input[c+1u]  +
+                float(int((qd >>  8u) & 0xFu) - 8) * s_input[c+2u]  +
+                float(int((qd >> 12u) & 0xFu) - 8) * s_input[c+3u]  +
+                float(int((qd >> 16u) & 0xFu) - 8) * s_input[c+4u]  +
+                float(int((qd >> 20u) & 0xFu) - 8) * s_input[c+5u]  +
+                float(int((qd >> 24u) & 0xFu) - 8) * s_input[c+6u]  +
+                float(int((qd >> 28u) & 0xFu) - 8) * s_input[c+7u]);
+        }
+
+        // ── Odd block (quant data at byte offset 0 within word → direct read) ──
+        uint bb_odd = bb_even + 18u;
+        uint qw_o = (bb_odd + 2u) >> 2u;  // bb_odd%4=2, +2=4, aligned
+        uint cb_o = cb_e + 32u;
+        for (uint w = 0u; w < 4u; w++) {
+            uint qd = weight_data[qw_o + w];  // hardcoded qs=0, direct read
+            uint c = cb_o + w * 8u;
+            sum += scales.y * (
+                float(int((qd      ) & 0xFu) - 8) * s_input[c]      +
+                float(int((qd >>  4u) & 0xFu) - 8) * s_input[c+1u]  +
+                float(int((qd >>  8u) & 0xFu) - 8) * s_input[c+2u]  +
+                float(int((qd >> 12u) & 0xFu) - 8) * s_input[c+3u]  +
+                float(int((qd >> 16u) & 0xFu) - 8) * s_input[c+4u]  +
+                float(int((qd >> 20u) & 0xFu) - 8) * s_input[c+5u]  +
+                float(int((qd >> 24u) & 0xFu) - 8) * s_input[c+6u]  +
+                float(int((qd >> 28u) & 0xFu) - 8) * s_input[c+7u]);
+        }
+    }
+    // Trailing odd block (bpr is odd) — even alignment, qs=16
+    if ((bpr & 1u) != 0u) {
+        uint bb = row_base + (bpr - 1u) * 18u;
+        float scale = unpackHalf2x16(weight_data[bb >> 2u]).x;
+        uint qw = (bb + 2u) >> 2u;
+        uint cb = (bpr - 1u) * 32u;
+        for (uint w = 0u; w < 4u; w++) {
+            uint d0 = weight_data[qw + w];
+            uint d1 = weight_data[qw + w + 1u];
+            uint qd = (d0 >> 16u) | (d1 << 16u);
+            uint c = cb + w * 8u;
+            sum += scale * (
+                float(int((qd      ) & 0xFu) - 8) * s_input[c]      +
+                float(int((qd >>  4u) & 0xFu) - 8) * s_input[c+1u]  +
+                float(int((qd >>  8u) & 0xFu) - 8) * s_input[c+2u]  +
+                float(int((qd >> 12u) & 0xFu) - 8) * s_input[c+3u]  +
+                float(int((qd >> 16u) & 0xFu) - 8) * s_input[c+4u]  +
+                float(int((qd >> 20u) & 0xFu) - 8) * s_input[c+5u]  +
+                float(int((qd >> 24u) & 0xFu) - 8) * s_input[c+6u]  +
+                float(int((qd >> 28u) & 0xFu) - 8) * s_input[c+7u]);
+        }
+    }
+    return sum;
+}
+
 void qmv_q4_0_global(
     uint weight_word_offset,
     uint n_rows, uint n_cols, uint bpr,
@@ -256,8 +336,7 @@ void qmv_q4_0_global(
     uint total_threads = n_workgroups * 256u;
 
     // Cache input vector in shared memory (dim <= 2048)
-    bool use_shared = (n_cols <= 2048u);
-    if (use_shared) {
+    if (n_cols <= 2048u) {
         for (uint i = tid; i < n_cols; i += 256u) {
             s_input[i] = scratch[input_offset + i];
         }
@@ -267,51 +346,63 @@ void qmv_q4_0_global(
     uint tensor_base = weight_word_offset * 4u;
     uint row_stride = bpr * 18u;
 
-    for (uint row = global_tid; row < n_rows; row += total_threads) {
-        uint row_base = tensor_base + row * row_stride;
-        float sum = 0.0;
-
-        for (uint block = 0u; block < bpr; block++) {
-            uint bb = row_base + block * 18u;
-            uint scale_word = weight_data[bb >> 2u];
-            uint f16_bits = ((block & 1u) == 0u) ? (scale_word & 0xFFFFu) : ((scale_word >> 16u) & 0xFFFFu);
-            float scale = unpack_f16(f16_bits);
-
-            uint qbyte = bb + 2u;
-            uint qw = qbyte >> 2u;
-            uint qs = (qbyte & 3u) * 8u;
-            uint col_base = block * 32u;
-
-            for (uint w = 0u; w < 4u; w++) {
-                uint r0 = weight_data[qw + w];
-                uint r1 = weight_data[qw + w + 1u];
-                uint qd = (qs == 0u) ? r0 : ((r0 >> qs) | (r1 << (32u - qs)));
-                uint c = col_base + w * 8u;
-
-                float i0, i1, i2, i3, i4, i5, i6, i7;
-                if (use_shared) {
-                    i0=s_input[c]; i1=s_input[c+1u]; i2=s_input[c+2u]; i3=s_input[c+3u];
-                    i4=s_input[c+4u]; i5=s_input[c+5u]; i6=s_input[c+6u]; i7=s_input[c+7u];
-                } else {
-                    i0=scratch[input_offset+c]; i1=scratch[input_offset+c+1u];
-                    i2=scratch[input_offset+c+2u]; i3=scratch[input_offset+c+3u];
-                    i4=scratch[input_offset+c+4u]; i5=scratch[input_offset+c+5u];
-                    i6=scratch[input_offset+c+6u]; i7=scratch[input_offset+c+7u];
-                }
-
-                sum += scale * (
-                    float(int((qd      ) & 0xFu) - 8) * i0 +
-                    float(int((qd >>  4u) & 0xFu) - 8) * i1 +
-                    float(int((qd >>  8u) & 0xFu) - 8) * i2 +
-                    float(int((qd >> 12u) & 0xFu) - 8) * i3 +
-                    float(int((qd >> 16u) & 0xFu) - 8) * i4 +
-                    float(int((qd >> 20u) & 0xFu) - 8) * i5 +
-                    float(int((qd >> 24u) & 0xFu) - 8) * i6 +
-                    float(int((qd >> 28u) & 0xFu) - 8) * i7
-                );
-            }
+    if (n_cols <= 2048u) {
+        // Fast path: input in shared memory, no branches in hot loop
+        for (uint row = global_tid; row < n_rows; row += total_threads) {
+            scratch[output_offset + row] = qmv_row_shared(tensor_base + row * row_stride, bpr);
         }
-        scratch[output_offset + row] = sum;
+    } else {
+        // Fallback: input from global scratch (for ff_dim > 2048)
+        // Same block-pair unrolling with hardcoded alignment
+        for (uint row = global_tid; row < n_rows; row += total_threads) {
+            uint rb = tensor_base + row * row_stride;
+            float sum = 0.0;
+            uint pc = bpr >> 1u;
+            for (uint bp = 0u; bp < pc; bp++) {
+                uint bb_e = rb + bp * 36u;
+                vec2 sc = unpackHalf2x16(weight_data[bb_e >> 2u]);
+                // Even block (qs=16)
+                uint qw_e = (bb_e + 2u) >> 2u;
+                uint cb_e = bp * 64u;
+                for (uint w = 0u; w < 4u; w++) {
+                    uint d0 = weight_data[qw_e+w]; uint d1 = weight_data[qw_e+w+1u];
+                    uint qd = (d0 >> 16u) | (d1 << 16u);
+                    uint c = cb_e + w*8u;
+                    sum += sc.x * (
+                        float(int((qd      )&0xFu)-8)*scratch[input_offset+c]    +float(int((qd>> 4u)&0xFu)-8)*scratch[input_offset+c+1u]+
+                        float(int((qd>> 8u)&0xFu)-8)*scratch[input_offset+c+2u]+float(int((qd>>12u)&0xFu)-8)*scratch[input_offset+c+3u]+
+                        float(int((qd>>16u)&0xFu)-8)*scratch[input_offset+c+4u]+float(int((qd>>20u)&0xFu)-8)*scratch[input_offset+c+5u]+
+                        float(int((qd>>24u)&0xFu)-8)*scratch[input_offset+c+6u]+float(int((qd>>28u)&0xFu)-8)*scratch[input_offset+c+7u]);
+                }
+                // Odd block (qs=0)
+                uint qw_o = (bb_e + 20u) >> 2u;
+                uint cb_o = cb_e + 32u;
+                for (uint w = 0u; w < 4u; w++) {
+                    uint qd = weight_data[qw_o+w];
+                    uint c = cb_o + w*8u;
+                    sum += sc.y * (
+                        float(int((qd      )&0xFu)-8)*scratch[input_offset+c]    +float(int((qd>> 4u)&0xFu)-8)*scratch[input_offset+c+1u]+
+                        float(int((qd>> 8u)&0xFu)-8)*scratch[input_offset+c+2u]+float(int((qd>>12u)&0xFu)-8)*scratch[input_offset+c+3u]+
+                        float(int((qd>>16u)&0xFu)-8)*scratch[input_offset+c+4u]+float(int((qd>>20u)&0xFu)-8)*scratch[input_offset+c+5u]+
+                        float(int((qd>>24u)&0xFu)-8)*scratch[input_offset+c+6u]+float(int((qd>>28u)&0xFu)-8)*scratch[input_offset+c+7u]);
+                }
+            }
+            if ((bpr & 1u) != 0u) {
+                uint bb = rb + (bpr-1u)*18u;
+                float scale = unpackHalf2x16(weight_data[bb>>2u]).x;
+                uint qw = (bb+2u)>>2u; uint cb = (bpr-1u)*32u;
+                for (uint w = 0u; w < 4u; w++) {
+                    uint d0=weight_data[qw+w]; uint d1=weight_data[qw+w+1u];
+                    uint qd=(d0>>16u)|(d1<<16u); uint c=cb+w*8u;
+                    sum += scale*(
+                        float(int((qd      )&0xFu)-8)*scratch[input_offset+c]    +float(int((qd>> 4u)&0xFu)-8)*scratch[input_offset+c+1u]+
+                        float(int((qd>> 8u)&0xFu)-8)*scratch[input_offset+c+2u]+float(int((qd>>12u)&0xFu)-8)*scratch[input_offset+c+3u]+
+                        float(int((qd>>16u)&0xFu)-8)*scratch[input_offset+c+4u]+float(int((qd>>20u)&0xFu)-8)*scratch[input_offset+c+5u]+
+                        float(int((qd>>24u)&0xFu)-8)*scratch[input_offset+c+6u]+float(int((qd>>28u)&0xFu)-8)*scratch[input_offset+c+7u]);
+                }
+            }
+            scratch[output_offset + row] = sum;
+        }
     }
 
     grid_sync(n_workgroups);
@@ -396,80 +487,79 @@ void write_kv_cache_global(uint layer, uint position, uint n_workgroups) {
 // and benefits less from row parallelism.
 // ══════════════════════════════════════════════════════════════════════
 
-void attention_all_heads_wg0(uint layer, uint seq_len_val, uint n_workgroups) {
+void attention_multi_wg(uint layer, uint seq_len_val, uint n_workgroups) {
     uint wg = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
 
-    if (wg == 0u) {
-        uint kv_dim = n_kv_heads * head_dim;
-        uint layer_stride = max_seq_len * kv_dim;
-        uint layer_kv_offset = layer * layer_stride;
-        uint kv_group = n_heads / n_kv_heads;
-        float inv_sqrt_hd = 1.0 / sqrt(float(head_dim));
+    uint kv_dim = n_kv_heads * head_dim;
+    uint layer_stride = max_seq_len * kv_dim;
+    uint layer_kv_offset = layer * layer_stride;
+    uint kv_group = n_heads / n_kv_heads;
+    float inv_sqrt_hd = 1.0 / sqrt(float(head_dim));
 
-        for (uint head = 0u; head < n_heads; head++) {
-            uint kv_head = head / kv_group;
-            uint q_offset = SCRATCH_Q + head * head_dim;
-            uint kv_head_offset = kv_head * head_dim;
+    // Distribute heads across workgroups: each WG handles heads in stride
+    for (uint head = wg; head < n_heads; head += n_workgroups) {
+        uint kv_head = head / kv_group;
+        uint q_offset = SCRATCH_Q + head * head_dim;
+        uint kv_head_offset = kv_head * head_dim;
 
-            // Load query vector
-            if (tid < head_dim) {
-                s_temp_local[tid] = scratch[q_offset + tid];
-            }
-            barrier();
-
-            // Compute attention scores
-            for (uint p = tid; p < seq_len_val; p += 256u) {
-                float dot = 0.0;
-                uint k_pos_offset = layer_kv_offset + p * kv_dim + kv_head_offset;
-                for (uint d = 0u; d < head_dim; d++) {
-                    dot += s_temp_local[d] * k_cache[k_pos_offset + d];
-                }
-                s_attn[p] = dot * inv_sqrt_hd;
-            }
-            barrier();
-
-            // Softmax: find max
-            float local_max = -1.0e30;
-            for (uint p = tid; p < seq_len_val; p += 256u) {
-                local_max = max(local_max, s_attn[p]);
-            }
-            s_reduce[tid] = local_max;
-            barrier();
-            reduce_max_256();
-            float max_score = s_reduce[0];
-            barrier();
-
-            // Softmax: exp and sum
-            float local_sum = 0.0;
-            for (uint p = tid; p < seq_len_val; p += 256u) {
-                float e = exp(s_attn[p] - max_score);
-                s_attn[p] = e;
-                local_sum += e;
-            }
-            s_reduce[tid] = local_sum;
-            barrier();
-            reduce_sum_256();
-            float inv_sum = 1.0 / s_reduce[0];
-            barrier();
-
-            // Normalize
-            for (uint p = tid; p < seq_len_val; p += 256u) {
-                s_attn[p] *= inv_sum;
-            }
-            barrier();
-
-            // Weighted value sum
-            for (uint d = tid; d < head_dim; d += 256u) {
-                float sum = 0.0;
-                for (uint p = 0u; p < seq_len_val; p++) {
-                    uint v_pos_offset = layer_kv_offset + p * kv_dim + kv_head_offset;
-                    sum += s_attn[p] * v_cache[v_pos_offset + d];
-                }
-                scratch[SCRATCH_ATTN_OUT + head * head_dim + d] = sum;
-            }
-            barrier();
+        // Load query vector into shared memory
+        if (tid < head_dim) {
+            s_temp_local[tid] = scratch[q_offset + tid];
         }
+        barrier();
+
+        // Compute attention scores — store in s_attn (shared, per-WG)
+        for (uint p = tid; p < seq_len_val; p += 256u) {
+            float dot = 0.0;
+            uint k_pos_offset = layer_kv_offset + p * kv_dim + kv_head_offset;
+            for (uint d = 0u; d < head_dim; d++) {
+                dot += s_temp_local[d] * k_cache[k_pos_offset + d];
+            }
+            s_attn[p] = dot * inv_sqrt_hd;
+        }
+        barrier();
+
+        // Softmax: find max
+        float local_max = -1.0e30;
+        for (uint p = tid; p < seq_len_val; p += 256u) {
+            local_max = max(local_max, s_attn[p]);
+        }
+        s_reduce[tid] = local_max;
+        barrier();
+        reduce_max_256();
+        float max_score = s_reduce[0];
+        barrier();
+
+        // Softmax: exp and sum
+        float local_sum = 0.0;
+        for (uint p = tid; p < seq_len_val; p += 256u) {
+            float e = exp(s_attn[p] - max_score);
+            s_attn[p] = e;
+            local_sum += e;
+        }
+        s_reduce[tid] = local_sum;
+        barrier();
+        reduce_sum_256();
+        float inv_sum = 1.0 / s_reduce[0];
+        barrier();
+
+        // Normalize
+        for (uint p = tid; p < seq_len_val; p += 256u) {
+            s_attn[p] *= inv_sum;
+        }
+        barrier();
+
+        // Weighted value sum — write directly to global scratch
+        for (uint d = tid; d < head_dim; d += 256u) {
+            float sum = 0.0;
+            for (uint p = 0u; p < seq_len_val; p++) {
+                uint v_pos_offset = layer_kv_offset + p * kv_dim + kv_head_offset;
+                sum += s_attn[p] * v_cache[v_pos_offset + d];
+            }
+            scratch[SCRATCH_ATTN_OUT + head * head_dim + d] = sum;
+        }
+        barrier();
     }
 
     grid_sync(n_workgroups);
@@ -582,36 +672,8 @@ void main() {
                 } else {
                     weight_w = v_w; out_off = SCRATCH_V; row = r - q_rows - kv_rows;
                 }
-
-                uint row_base = weight_w * 4u + row * row_stride;
-                float sum = 0.0;
-                for (uint block = 0u; block < bpr_val; block++) {
-                    uint bb = row_base + block * 18u;
-                    uint scale_word = weight_data[bb >> 2u];
-                    uint f16_bits = ((block & 1u) == 0u) ? (scale_word & 0xFFFFu) : ((scale_word >> 16u) & 0xFFFFu);
-                    float scale = unpack_f16(f16_bits);
-                    uint qbyte = bb + 2u;
-                    uint qw = qbyte >> 2u;
-                    uint qs = (qbyte & 3u) * 8u;
-                    uint col_base = block * 32u;
-                    for (uint w = 0u; w < 4u; w++) {
-                        uint r0 = weight_data[qw + w];
-                        uint r1 = weight_data[qw + w + 1u];
-                        uint qd = (qs == 0u) ? r0 : ((r0 >> qs) | (r1 << (32u - qs)));
-                        uint c = col_base + w * 8u;
-                        sum += scale * (
-                            float(int((qd      ) & 0xFu) - 8) * s_input[c]      +
-                            float(int((qd >>  4u) & 0xFu) - 8) * s_input[c + 1u] +
-                            float(int((qd >>  8u) & 0xFu) - 8) * s_input[c + 2u] +
-                            float(int((qd >> 12u) & 0xFu) - 8) * s_input[c + 3u] +
-                            float(int((qd >> 16u) & 0xFu) - 8) * s_input[c + 4u] +
-                            float(int((qd >> 20u) & 0xFu) - 8) * s_input[c + 5u] +
-                            float(int((qd >> 24u) & 0xFu) - 8) * s_input[c + 6u] +
-                            float(int((qd >> 28u) & 0xFu) - 8) * s_input[c + 7u]
-                        );
-                    }
-                }
-                scratch[out_off + row] = sum;
+                // Use the optimized branchless shared-memory QMV
+                scratch[out_off + row] = qmv_row_shared(weight_w * 4u + row * row_stride, bpr_val);
             }
         }
         grid_sync(n_wgs);
@@ -661,8 +723,8 @@ void main() {
         }
         grid_sync(n_wgs);
 
-        // ── Attention (WG0 only, others wait) ──────────────────────
-        attention_all_heads_wg0(layer, seq_len_val, n_wgs);
+        // ── Attention (distributed across all workgroups) ───────────
+        attention_multi_wg(layer, seq_len_val, n_wgs);
 
         // ── Output Projection: ATTN_OUT -> ATTN_PROJ ───────────────
         qmv_q4_0_global(
@@ -703,36 +765,7 @@ void main() {
                 } else {
                     weight_w = up_w; out_off = SCRATCH_UP; row = r - ff_dim;
                 }
-
-                uint row_base = weight_w * 4u + row * row_stride;
-                float sum = 0.0;
-                for (uint block = 0u; block < bpr_val; block++) {
-                    uint bb = row_base + block * 18u;
-                    uint scale_word = weight_data[bb >> 2u];
-                    uint f16_bits = ((block & 1u) == 0u) ? (scale_word & 0xFFFFu) : ((scale_word >> 16u) & 0xFFFFu);
-                    float scale = unpack_f16(f16_bits);
-                    uint qbyte = bb + 2u;
-                    uint qw = qbyte >> 2u;
-                    uint qs = (qbyte & 3u) * 8u;
-                    uint col_base = block * 32u;
-                    for (uint w = 0u; w < 4u; w++) {
-                        uint r0 = weight_data[qw + w];
-                        uint r1 = weight_data[qw + w + 1u];
-                        uint qd = (qs == 0u) ? r0 : ((r0 >> qs) | (r1 << (32u - qs)));
-                        uint c = col_base + w * 8u;
-                        sum += scale * (
-                            float(int((qd      ) & 0xFu) - 8) * s_input[c]      +
-                            float(int((qd >>  4u) & 0xFu) - 8) * s_input[c + 1u] +
-                            float(int((qd >>  8u) & 0xFu) - 8) * s_input[c + 2u] +
-                            float(int((qd >> 12u) & 0xFu) - 8) * s_input[c + 3u] +
-                            float(int((qd >> 16u) & 0xFu) - 8) * s_input[c + 4u] +
-                            float(int((qd >> 20u) & 0xFu) - 8) * s_input[c + 5u] +
-                            float(int((qd >> 24u) & 0xFu) - 8) * s_input[c + 6u] +
-                            float(int((qd >> 28u) & 0xFu) - 8) * s_input[c + 7u]
-                        );
-                    }
-                }
-                scratch[out_off + row] = sum;
+                scratch[out_off + row] = qmv_row_shared(weight_w * 4u + row * row_stride, bpr_val);
             }
         }
         grid_sync(n_wgs);
@@ -785,37 +818,6 @@ void main() {
     uint out_row_stride = out_bpr * 18u;
 
     for (uint row = global_tid; row < vocab_size; row += total_threads) {
-        uint row_base = out_tensor_base + row * out_row_stride;
-        float sum = 0.0;
-
-        for (uint block = 0u; block < out_bpr; block++) {
-            uint bb = row_base + block * 18u;
-            uint scale_word = weight_data[bb >> 2u];
-            uint f16_bits = ((block & 1u) == 0u) ? (scale_word & 0xFFFFu) : ((scale_word >> 16u) & 0xFFFFu);
-            float scale = unpack_f16(f16_bits);
-
-            uint qbyte = bb + 2u;
-            uint qw = qbyte >> 2u;
-            uint qs = (qbyte & 3u) * 8u;
-            uint col_base = block * 32u;
-
-            for (uint w = 0u; w < 4u; w++) {
-                uint r0 = weight_data[qw + w];
-                uint r1 = weight_data[qw + w + 1u];
-                uint qd = (qs == 0u) ? r0 : ((r0 >> qs) | (r1 << (32u - qs)));
-                uint c = col_base + w * 8u;
-                sum += scale * (
-                    float(int((qd      ) & 0xFu) - 8) * s_input[c]      +
-                    float(int((qd >>  4u) & 0xFu) - 8) * s_input[c + 1u] +
-                    float(int((qd >>  8u) & 0xFu) - 8) * s_input[c + 2u] +
-                    float(int((qd >> 12u) & 0xFu) - 8) * s_input[c + 3u] +
-                    float(int((qd >> 16u) & 0xFu) - 8) * s_input[c + 4u] +
-                    float(int((qd >> 20u) & 0xFu) - 8) * s_input[c + 5u] +
-                    float(int((qd >> 24u) & 0xFu) - 8) * s_input[c + 6u] +
-                    float(int((qd >> 28u) & 0xFu) - 8) * s_input[c + 7u]
-                );
-            }
-        }
-        output_logits[row] = sum;
+        output_logits[row] = qmv_row_shared(out_tensor_base + row * out_row_stride, out_bpr);
     }
 }
