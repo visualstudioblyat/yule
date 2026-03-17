@@ -350,7 +350,7 @@ impl<'a> GpuTransformerRunner<'a> {
             let in_dim = dim as u32;
             let ff = self.cfg.ff_dim as u32;
 
-            // residual = hidden (GPU copy, no barrier needed before — hidden is ready)
+            // residual = hidden (GPU copy)
             self.backend.copy_buffer_batched(
                 cmd,
                 &self.scratch.hidden,
@@ -359,7 +359,7 @@ impl<'a> GpuTransformerRunner<'a> {
                 0,
                 dim * 4,
             )?;
-            self.backend.transfer_barrier(cmd);
+            // No transfer_barrier needed: next op (RMSNorm) reads hidden, not residual
 
             // normed = rms_norm(hidden, attn_norm)
             {
@@ -460,7 +460,9 @@ impl<'a> GpuTransformerRunner<'a> {
 
             // Attention — per-head GQA dispatch
             let kv_group = n_heads / n_kv_heads;
-            let use_flash_decode = seq_len >= 256;
+            // Flash-Decoding: use split-KV for any non-trivial sequence
+            // Eliminates 2,112 per-head dispatches per token (the #1 bottleneck)
+            let use_flash_decode = seq_len >= 4;
 
             if use_flash_decode {
                 // Flash-Decoding: split-KV attention for long sequences
@@ -602,7 +604,7 @@ impl<'a> GpuTransformerRunner<'a> {
                 0,
                 dim * 4,
             )?;
-            self.backend.transfer_barrier(cmd);
+            // No transfer_barrier: next op (RMSNorm) reads hidden, not residual
 
             // FFN norm
             {
