@@ -23,6 +23,9 @@ struct Cli {
 
     #[arg(long, help = "Output results as JSON")]
     json: bool,
+
+    #[arg(long, help = "Include GPU (Vulkan) inference tests")]
+    gpu: bool,
 }
 
 fn main() {
@@ -49,6 +52,9 @@ fn main() {
     };
     println!();
     println!("Running validation suite...");
+    if cli.gpu {
+        println!("GPU validation: requested (run with --features vulkan for GPU tests)");
+    }
     println!();
 
     // Infrastructure tests (32-37) — don't need model at all

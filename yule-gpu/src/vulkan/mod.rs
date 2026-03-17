@@ -210,15 +210,32 @@ impl VulkanBackend {
             let split_start = s * split_size;
             let split_end = ((s + 1) * split_size).min(seq_len);
 
-            let push = [head_dim, split_start, split_end, head_offset, kv_offset, kv_stride, s];
+            let push = [
+                head_dim,
+                split_start,
+                split_end,
+                head_offset,
+                kv_offset,
+                kv_stride,
+                s,
+            ];
             let push_bytes: &[u8] = bytemuck::cast_slice(&push);
 
             self.dispatch_batched(
                 cmd,
                 ShaderKey::FlashDecodeSplit,
-                &[q, k_cache, v_cache, &partial_out, &partial_lse, &partial_max],
+                &[
+                    q,
+                    k_cache,
+                    v_cache,
+                    &partial_out,
+                    &partial_lse,
+                    &partial_max,
+                ],
                 push_bytes,
-                1, 1, 1, // single workgroup per split (256 threads handle the split internally)
+                1,
+                1,
+                1, // single workgroup per split (256 threads handle the split internally)
             )?;
         }
 
@@ -233,7 +250,9 @@ impl VulkanBackend {
             ShaderKey::FlashDecodeReduce,
             &[&partial_out, &partial_lse, &partial_max, output],
             reduce_bytes,
-            1, 1, 1,
+            1,
+            1,
+            1,
         )?;
 
         // Free temporary buffers

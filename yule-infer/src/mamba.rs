@@ -172,11 +172,40 @@ impl<'a> MambaRunner<'a> {
         let dim = meta.embedding_dim as usize;
         let n_layers = meta.layer_count as usize;
 
-        // Mamba defaults — infer from tensor shapes if possible
-        let d_inner = 2 * dim;
-        let d_state = 16;
-        let d_conv = 4;
-        let dt_rank = dim.div_ceil(16);
+        // Infer SSM dimensions from tensor shapes when available,
+        // falling back to Mamba defaults if tensors are missing.
+        let d_inner = if let Some((info, _)) = store.get("blk.0.ssm_in.weight") {
+            // in_proj maps dim → 2*d_inner, so shape[0] = 2*d_inner
+            if info.shape.len() >= 2 {
+                info.shape[0] as usize / 2
+            } else {
+                2 * dim
+            }
+        } else {
+            2 * dim
+        };
+
+        let d_conv = if let Some((info, _)) = store.get("blk.0.ssm_conv1d.weight") {
+            // conv1d weight shape: [d_inner, 1, d_conv] or [d_inner, d_conv]
+            *info.shape.last().unwrap_or(&4) as usize
+        } else {
+            4
+        };
+
+        let (dt_rank, d_state) = if let Some((info, _)) = store.get("blk.0.ssm_x.weight") {
+            // x_proj maps d_inner → dt_rank + 2*d_state, so shape[0] = dt_rank + 2*d_state
+            if info.shape.len() >= 2 {
+                let x_proj_out = info.shape[0] as usize;
+                // Assume d_state=16 (universal across known Mamba models) to solve for dt_rank
+                let ds = 16usize;
+                let dr = x_proj_out.saturating_sub(2 * ds);
+                (dr, ds)
+            } else {
+                (dim.div_ceil(16), 16)
+            }
+        } else {
+            (dim.div_ceil(16), 16)
+        };
         let vocab_size = meta.vocab_size as usize;
 
         let cfg = MambaConfig {
