@@ -1,0 +1,116 @@
+#version 450
+
+// Q4_0 quantized matmul with COALESCED memory access.
+//
+// The original qmv_q4_0.comp has each thread independently read 18-byte Q4_0 blocks.
+// 32 threads × 18 bytes = 576 bytes scattered across memory.
+// A cache line is 128 bytes. This causes 4.5x bandwidth amplification.
+//
+// This shader fixes it: threads COOPERATIVELY load weight blocks into shared memory
+// using 128-byte aligned reads, then process from shared memory.
+//
+// Expected improvement: 2-3x on QMV (which is 87% of forward pass time).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Weights { uint weight_data[]; };
+layout(set = 0, binding = 1) buffer Input { float input_data[]; };
+layout(set = 0, binding = 2) buffer Out { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint n_rows;
+    uint n_cols;
+    uint blocks_per_row;
+};
+
+// Shared memory tile for cooperative weight loading
+// Each Q4_0 block is 18 bytes. Load 32 blocks at a time = 576 bytes.
+// Round up to 640 bytes (160 uint) for alignment.
+shared uint shared_weights[160];  // 32 blocks × 5 uint (ceil(18/4))
+shared float partial_sums[256];
+
+float unpack_f16(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) {
+        float val = ldexp(float(mant), -24);
+        return sign == 1u ? -val : val;
+    }
+    if (exp == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+    float val = ldexp(float(mant | 0x400u), int(exp) - 25);
+    return sign == 1u ? -val : val;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= n_rows) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint row_byte_offset = row * blocks_per_row * 18u;
+    float sum = 0.0;
+
+    // Process blocks in tiles of 32 (workgroup cooperatively loads each tile)
+    for (uint tile_start = 0; tile_start < blocks_per_row; tile_start += 32u) {
+        uint tile_end = min(tile_start + 32u, blocks_per_row);
+        uint tile_blocks = tile_end - tile_start;
+
+        // ── Cooperative load: all 256 threads load weight data into shared memory ──
+        // Each block is 18 bytes = 4.5 uint. We load 5 uint per block to be safe.
+        // Total: tile_blocks * 5 uint. 256 threads load this cooperatively.
+        uint total_uints = tile_blocks * 5u;
+        uint base_uint_offset = (row_byte_offset + tile_start * 18u) / 4u;
+
+        for (uint i = tid; i < total_uints; i += gl_WorkGroupSize.x) {
+            // Coalesced read: consecutive threads read consecutive uint addresses
+            uint global_idx = base_uint_offset + i;
+            if (global_idx < weight_data.length()) {
+                shared_weights[i] = weight_data[global_idx];
+            }
+        }
+        barrier();
+
+        // ── Process blocks from shared memory ──
+        // Each thread handles a subset of blocks in this tile
+        for (uint block_in_tile = tid; block_in_tile < tile_blocks; block_in_tile += gl_WorkGroupSize.x) {
+            uint block = tile_start + block_in_tile;
+
+            // Read from shared memory instead of global memory
+            uint sw_base = block_in_tile * 5u; // 5 uint per block in shared memory
+            uint raw0 = shared_weights[sw_base];
+
+            // Extract f16 scale from first 2 bytes
+            uint f16_bits = raw0 & 0xFFFFu;
+            float scale = unpack_f16(f16_bits);
+
+            uint col_base = block * 32u;
+
+            // Process 16 bytes of nibbles (32 weights)
+            // The nibble data starts at byte 2 within the block
+            // In shared memory, that's at bit offset 16 of the first uint
+            for (uint j = 0u; j < 16u; j++) {
+                // Read the nibble byte from shared memory
+                uint byte_offset_in_block = 2u + j;
+                uint uint_idx = sw_base + byte_offset_in_block / 4u;
+                uint byte_shift = (byte_offset_in_block % 4u) * 8u;
+                uint byte_val = (shared_weights[uint_idx] >> byte_shift) & 0xFFu;
+
+                float q0 = float(int(byte_val & 0xFu) - 8);
+                float q1 = float(int((byte_val >> 4u) & 0xFu) - 8);
+
+                uint c0 = col_base + j * 2u;
+                if (c0 < n_cols)      sum += scale * q0 * input_data[c0];
+                if (c0 + 1u < n_cols) sum += scale * q1 * input_data[c0 + 1u];
+            }
+        }
+        barrier(); // sync before next tile load
+    }
+
+    partial_sums[tid] = sum;
+    barrier();
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) partial_sums[tid] += partial_sums[tid + s];
+        barrier();
+    }
+    if (tid == 0) out_data[row] = partial_sums[0];
+}
