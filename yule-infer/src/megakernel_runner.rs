@@ -432,6 +432,26 @@ impl<'a> MegakernelRunner<'a> {
             .unwrap_or(0);
         let non_zero = logits_cpu.iter().filter(|&&v| v != 0.0).count();
         let nan_count = logits_cpu.iter().filter(|v| v.is_nan()).count();
+        // Debug checkpoints from shader
+        let vs = self.cfg.vocab_size;
+        eprintln!(
+            "DEBUG: Q[0]={:.4} Q[1]={:.4} Q[2]={:.4} K[0]={:.4} s_temp[0]={:.4} s_temp[1]={:.4}",
+            logits_cpu[vs - 11],
+            logits_cpu[vs - 20],
+            logits_cpu[vs - 21],
+            logits_cpu[vs - 12],
+            logits_cpu[vs - 18],
+            logits_cpu[vs - 19]
+        );
+        eprintln!(
+            "DEBUG: attn_out[0]={:.4} hidden[0]={:.4} hidden[1]={:.4} nan_count={:.0} gate={:.4} ffn_out={:.4}",
+            logits_cpu[vs - 10],
+            logits_cpu[vs - 13],
+            logits_cpu[vs - 14],
+            logits_cpu[vs - 15],
+            logits_cpu[vs - 16],
+            logits_cpu[vs - 17]
+        );
         eprintln!(
             "megakernel logits: min={:.4} max={:.4} argmax={} non_zero={}/{} nan={} first5=[{:.4},{:.4},{:.4},{:.4},{:.4}]",
             min_val,

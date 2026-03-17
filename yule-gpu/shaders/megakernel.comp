@@ -284,6 +284,8 @@ void qmv_q4_0_from_shared(
                 f16_bits = ((raw >> (sb * 8u)) | (next_raw << (32u - sb * 8u))) & 0xFFFFu;
             }
             float scale = unpack_f16(f16_bits);
+            // Guard against inf/NaN scales (corrupted or extreme Q4_0 blocks)
+            if (isinf(scale) || isnan(scale)) scale = 0.0;
 
             // --- Process 16 bytes of quantized data (32 elements, 4 bits each) ---
             uint qoff = abs_boff + 2u;
@@ -348,6 +350,8 @@ void qmv_q4_0_from_global(
                 f16_bits = ((raw >> (sb * 8u)) | (next_raw << (32u - sb * 8u))) & 0xFFFFu;
             }
             float scale = unpack_f16(f16_bits);
+            // Guard against inf/NaN scales (corrupted or extreme Q4_0 blocks)
+            if (isinf(scale) || isnan(scale)) scale = 0.0;
 
             // Process 16 bytes of quantized data
             uint qoff = abs_boff + 2u;
@@ -766,6 +770,8 @@ void main() {
                 f16_bits = ((raw >> (sb * 8u)) | (next_raw << (32u - sb * 8u))) & 0xFFFFu;
             }
             float scale = unpack_f16(f16_bits);
+            // Guard against inf/NaN scales (corrupted or extreme Q4_0 blocks)
+            if (isinf(scale) || isnan(scale)) scale = 0.0;
 
             // Process 16 bytes of quantized data
             uint qoff = abs_boff + 2u;

@@ -1,6 +1,7 @@
 #version 450
 
-// DEBUG: Dump scale values for multiple rows of the output weight
+// DEBUG: Test JUST RMSNorm in the megakernel context
+// Load embedding → RMSNorm with layer 0 attn_norm → output first values
 
 layout(local_size_x = 256) in;
 
@@ -30,49 +31,64 @@ layout(push_constant) uniform Params {
     uint blocks_per_row_kv;
 };
 
-float unpack_f16(uint bits) {
-    uint sign = (bits >> 15) & 1u;
-    uint exp_val = (bits >> 10) & 0x1Fu;
-    uint mant = bits & 0x3FFu;
-    if (exp_val == 0u) return sign == 1u ? -ldexp(float(mant), -24) : ldexp(float(mant), -24);
-    if (exp_val == 31u) return sign == 1u ? -1.0/0.0 : 1.0/0.0;
-    float val = ldexp(float(mant | 0x400u), int(exp_val) - 25);
-    return sign == 1u ? -val : val;
-}
+shared float s_hidden[2048];
+shared float s_temp[2048];
+shared float s_reduce[256];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(norm_eps_bits);
 
-    // Dump scale of block 0 for rows 0, 1, 256, 257, 512, 513, 1000, 2000
-    uint test_rows[8] = uint[8](0u, 1u, 256u, 257u, 512u, 513u, 1000u, 2000u);
+    // Load embedding
+    for (uint i = tid; i < dim; i += 256u) {
+        s_hidden[i] = input_embedding[i];
+    }
+    barrier();
 
-    if (tid < 8u) {
-        uint row = test_rows[tid];
-        uint output_w_offset = offsets[n_layers * 9u + 1u];
-        uint bpr = blocks_per_row_dim;
+    // Write raw embedding values to logits for comparison
+    if (tid == 0u) {
+        output_logits[0] = s_hidden[0];     // emb[0]
+        output_logits[1] = s_hidden[1];     // emb[1]
+        output_logits[2] = s_hidden[100];   // emb[100]
+        output_logits[3] = norm_weights[0]; // norm_weight[0]
+        output_logits[4] = norm_weights[1]; // norm_weight[1]
+    }
+    barrier();
 
-        uint boff = row * bpr * 18u;
-        uint abs_boff = output_w_offset * 4u + boff;
-        uint sw = abs_boff / 4u;
-        uint sb = abs_boff % 4u;
-        uint raw = weight_data[sw];
-        uint f16_bits;
-        if (sb == 0u)      f16_bits = raw & 0xFFFFu;
-        else if (sb == 2u) f16_bits = (raw >> 16) & 0xFFFFu;
-        else {
-            uint next_raw = weight_data[sw + 1u];
-            f16_bits = ((raw >> (sb * 8u)) | (next_raw << (32u - sb * 8u))) & 0xFFFFu;
-        }
-        float scale = unpack_f16(f16_bits);
+    // RMSNorm (same code as megakernel's rms_norm_to_temp)
+    float ss = 0.0;
+    for (uint i = tid; i < dim; i += 256u) {
+        float v = s_hidden[i];
+        ss += v * v;
+    }
+    s_reduce[tid] = ss;
+    barrier();
 
-        output_logits[tid * 4u + 0u] = float(row);
-        output_logits[tid * 4u + 1u] = scale;
-        output_logits[tid * 4u + 2u] = float(f16_bits);
-        output_logits[tid * 4u + 3u] = float(sb);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
+        barrier();
+    }
+    float inv_rms = 1.0 / sqrt(s_reduce[0] / float(dim) + eps);
+    barrier();
+
+    // norm_offset for layer 0, attn_norm (norm_type=0) = 0 * 2 * dim = 0
+    uint norm_offset = 0u;
+    for (uint i = tid; i < dim; i += 256u) {
+        s_temp[i] = s_hidden[i] * inv_rms * norm_weights[norm_offset + i];
+    }
+    barrier();
+
+    // Write normed values
+    if (tid == 0u) {
+        output_logits[5] = s_temp[0];       // normed[0]
+        output_logits[6] = s_temp[1];       // normed[1]
+        output_logits[7] = s_temp[100];     // normed[100]
+        output_logits[8] = inv_rms;         // the RMS inverse
+        output_logits[9] = s_reduce[0];     // sum of squares (should be read before reduce overwrites)
     }
 
     // Zero rest
-    for (uint i = 32u + tid; i < vocab_size; i += 256u) {
+    for (uint i = 10u + tid; i < vocab_size; i += 256u) {
         output_logits[i] = 0.0;
     }
 }
