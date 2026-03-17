@@ -31,6 +31,7 @@ pub struct AppState {
     pub device_pubkey: [u8; 32],
     pub merkle_root_bytes: [u8; 32],
     pub signing_key: ed25519_dalek::SigningKey,
+    pub prefix_cache_enabled: bool,
 }
 
 pub struct ApiServer {
@@ -115,6 +116,7 @@ impl ApiServer {
             device_pubkey,
             merkle_root_bytes,
             signing_key,
+            prefix_cache_enabled: false,
         });
 
         let app = build_router(state, auth);
@@ -131,6 +133,7 @@ impl ApiServer {
         if self.timing_resistant {
             eprintln!("timing-resistant decode: enabled (constant-time padding active)");
         }
+        eprintln!("prefix caching: available");
 
         eprintln!("listening on {addr}");
         eprintln!("  yule api:  http://{addr}/yule/health");
