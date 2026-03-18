@@ -1,5 +1,7 @@
 #version 450
 #extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
 
 // ══════════════════════════════════════════════════════════════════════
 // Yule Megakernel v2: Multi-Workgroup Transformer Forward Pass
@@ -109,20 +111,39 @@ float unpack_block_scale(uint scale_word, uint block_idx) {
 // UTILITY: Parallel reduction (sum/max) over s_reduce[0..255]
 // ══════════════════════════════════════════════════════════════════════
 
+// Fast 256-thread sum reduction using subgroup ops.
+// Phase 1: subgroupAdd within each warp (32 threads → 1 value)
+// Phase 2: first thread of each warp writes to shared, then tree reduce 8 values
+// Uses only 2 barriers total instead of 8.
 void reduce_sum_256() {
     uint tid = gl_LocalInvocationID.x;
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) s_reduce[tid] += s_reduce[tid + s];
-        barrier();
+    float val = subgroupAdd(s_reduce[tid]);
+    if (gl_SubgroupInvocationID == 0u) {
+        s_reduce[gl_SubgroupID] = val;
     }
+    barrier();
+    // All threads participate in the final tree reduce (only first 8 slots matter)
+    if (tid < 4u) s_reduce[tid] += s_reduce[tid + 4u];
+    barrier();
+    if (tid < 2u) s_reduce[tid] += s_reduce[tid + 2u];
+    barrier();
+    if (tid == 0u) s_reduce[0] += s_reduce[1];
+    barrier();
 }
 
 void reduce_max_256() {
     uint tid = gl_LocalInvocationID.x;
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + s]);
-        barrier();
+    float val = subgroupMax(s_reduce[tid]);
+    if (gl_SubgroupInvocationID == 0u) {
+        s_reduce[gl_SubgroupID] = val;
     }
+    barrier();
+    if (tid < 4u) s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + 4u]);
+    barrier();
+    if (tid < 2u) s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + 2u]);
+    barrier();
+    if (tid == 0u) s_reduce[0] = max(s_reduce[0], s_reduce[1]);
+    barrier();
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -472,8 +493,9 @@ void attention_multi_wg(uint layer, uint seq_len_val, uint n_workgroups) {
 
         // Softmax: exp and sum
         float local_sum = 0.0;
+        float log2e = 1.4426950408889634;
         for (uint p = tid; p < seq_len_val; p += 256u) {
-            float e = exp(s_attn[p] - max_score);
+            float e = exp2((s_attn[p] - max_score) * log2e);
             s_attn[p] = e;
             local_sum += e;
         }
@@ -717,7 +739,9 @@ void main() {
         // Write result to both SCRATCH_GATE and s_input for down projection
         for (uint i = global_tid; i < ff_dim; i += total_threads) {
             float g = scratch[SCRATCH_GATE + i];
-            float result = (g / (1.0 + exp(-g))) * scratch[SCRATCH_UP + i];
+            // SiLU(g) = g * sigmoid(g) = g / (1 + exp(-g))
+            // Use exp2 (native HW instruction) instead of exp
+            float result = (g / (1.0 + exp2(-g * 1.4426950408889634))) * scratch[SCRATCH_UP + i];
             scratch[SCRATCH_GATE + i] = result;
         }
         grid_sync(n_wgs);
