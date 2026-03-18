@@ -99,6 +99,7 @@ fn mock_state() -> (Arc<AppState>, String) {
         device_pubkey: signing_key.verifying_key().to_bytes(),
         merkle_root_bytes: [0xff; 32],
         signing_key,
+        prefix_cache_enabled: false,
     });
 
     (state, token)

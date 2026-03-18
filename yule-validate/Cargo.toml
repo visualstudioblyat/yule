@@ -30,3 +30,6 @@ ed25519-dalek = { workspace = true }
 bytemuck = { workspace = true }
 getrandom = { workspace = true }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

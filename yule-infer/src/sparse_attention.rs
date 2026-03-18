@@ -177,6 +177,7 @@ pub fn block_sparse_attention(
 }
 
 /// Dense (full) attention for reference / testing.
+#[allow(dead_code)]
 fn dense_attention(
     q: &[f32],
     k: &[f32],

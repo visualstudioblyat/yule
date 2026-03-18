@@ -145,11 +145,12 @@ mod tests {
     #[test]
     fn test_merge_map_correctness() {
         // 16 tokens: pairs (0,1) and (2,3) are identical, rest differ
-        let mut embeddings: Vec<Vec<f32>> = Vec::new();
-        embeddings.push(vec![1.0, 0.0, 0.0, 0.0]);
-        embeddings.push(vec![1.0, 0.0, 0.0, 0.0]);
-        embeddings.push(vec![0.0, 1.0, 0.0, 0.0]);
-        embeddings.push(vec![0.0, 1.0, 0.0, 0.0]);
+        let mut embeddings: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+        ];
         for i in 4..16 {
             let mut v = vec![0.0f32; 16];
             v[i] = 1.0;

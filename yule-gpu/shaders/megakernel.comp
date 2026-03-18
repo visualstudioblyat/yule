@@ -255,22 +255,24 @@ float qmv_row_shared(uint row_base, uint bpr) {
         vec2 scales = unpackHalf2x16(weight_data[bb_even >> 2u]);
 
         // ── Even block (quant data at byte offset 2 within word → shift 16) ──
-        uint qw_e = (bb_even + 2u) >> 2u;  // = (bb_even >> 2u) + 0 since bb_even%4=0, +2 bytes = within same word start
+        // Pipeline reads: d1 of iteration w becomes d0 of iteration w+1
+        uint qw_e = (bb_even + 2u) >> 2u;
         uint cb_e = bp * 64u;
+        uint prev_e = weight_data[qw_e];
         for (uint w = 0u; w < 4u; w++) {
-            uint d0 = weight_data[qw_e + w];
-            uint d1 = weight_data[qw_e + w + 1u];
-            uint qd = (d0 >> 16u) | (d1 << 16u);  // hardcoded qs=16
+            uint next_e = weight_data[qw_e + w + 1u];
+            uint qd = (prev_e >> 16u) | (next_e << 16u);
+            prev_e = next_e;
             uint c = cb_e + w * 8u;
             sum += scales.x * (
-                float(int((qd      ) & 0xFu) - 8) * s_input[c]      +
-                float(int((qd >>  4u) & 0xFu) - 8) * s_input[c+1u]  +
-                float(int((qd >>  8u) & 0xFu) - 8) * s_input[c+2u]  +
-                float(int((qd >> 12u) & 0xFu) - 8) * s_input[c+3u]  +
-                float(int((qd >> 16u) & 0xFu) - 8) * s_input[c+4u]  +
-                float(int((qd >> 20u) & 0xFu) - 8) * s_input[c+5u]  +
-                float(int((qd >> 24u) & 0xFu) - 8) * s_input[c+6u]  +
-                float(int((qd >> 28u) & 0xFu) - 8) * s_input[c+7u]);
+                (float(qd & 0xFu) - 8.0) * s_input[c]      +
+                (float((qd >> 4u) & 0xFu) - 8.0) * s_input[c+1u]  +
+                (float((qd >> 8u) & 0xFu) - 8.0) * s_input[c+2u]  +
+                (float((qd >> 12u) & 0xFu) - 8.0) * s_input[c+3u]  +
+                (float((qd >> 16u) & 0xFu) - 8.0) * s_input[c+4u]  +
+                (float((qd >> 20u) & 0xFu) - 8.0) * s_input[c+5u]  +
+                (float((qd >> 24u) & 0xFu) - 8.0) * s_input[c+6u]  +
+                (float(qd >> 28u) - 8.0) * s_input[c+7u]);
         }
 
         // ── Odd block (quant data at byte offset 0 within word → direct read) ──
@@ -281,14 +283,14 @@ float qmv_row_shared(uint row_base, uint bpr) {
             uint qd = weight_data[qw_o + w];  // hardcoded qs=0, direct read
             uint c = cb_o + w * 8u;
             sum += scales.y * (
-                float(int((qd      ) & 0xFu) - 8) * s_input[c]      +
-                float(int((qd >>  4u) & 0xFu) - 8) * s_input[c+1u]  +
-                float(int((qd >>  8u) & 0xFu) - 8) * s_input[c+2u]  +
-                float(int((qd >> 12u) & 0xFu) - 8) * s_input[c+3u]  +
-                float(int((qd >> 16u) & 0xFu) - 8) * s_input[c+4u]  +
-                float(int((qd >> 20u) & 0xFu) - 8) * s_input[c+5u]  +
-                float(int((qd >> 24u) & 0xFu) - 8) * s_input[c+6u]  +
-                float(int((qd >> 28u) & 0xFu) - 8) * s_input[c+7u]);
+                (float(qd & 0xFu) - 8.0) * s_input[c]      +
+                (float((qd >> 4u) & 0xFu) - 8.0) * s_input[c+1u]  +
+                (float((qd >> 8u) & 0xFu) - 8.0) * s_input[c+2u]  +
+                (float((qd >> 12u) & 0xFu) - 8.0) * s_input[c+3u]  +
+                (float((qd >> 16u) & 0xFu) - 8.0) * s_input[c+4u]  +
+                (float((qd >> 20u) & 0xFu) - 8.0) * s_input[c+5u]  +
+                (float((qd >> 24u) & 0xFu) - 8.0) * s_input[c+6u]  +
+                (float(qd >> 28u) - 8.0) * s_input[c+7u]);
         }
     }
     // Trailing odd block (bpr is odd) — even alignment, qs=16
@@ -297,20 +299,21 @@ float qmv_row_shared(uint row_base, uint bpr) {
         float scale = unpackHalf2x16(weight_data[bb >> 2u]).x;
         uint qw = (bb + 2u) >> 2u;
         uint cb = (bpr - 1u) * 32u;
+        uint prev_t = weight_data[qw];
         for (uint w = 0u; w < 4u; w++) {
-            uint d0 = weight_data[qw + w];
-            uint d1 = weight_data[qw + w + 1u];
-            uint qd = (d0 >> 16u) | (d1 << 16u);
+            uint next_t = weight_data[qw + w + 1u];
+            uint qd = (prev_t >> 16u) | (next_t << 16u);
+            prev_t = next_t;
             uint c = cb + w * 8u;
             sum += scale * (
-                float(int((qd      ) & 0xFu) - 8) * s_input[c]      +
-                float(int((qd >>  4u) & 0xFu) - 8) * s_input[c+1u]  +
-                float(int((qd >>  8u) & 0xFu) - 8) * s_input[c+2u]  +
-                float(int((qd >> 12u) & 0xFu) - 8) * s_input[c+3u]  +
-                float(int((qd >> 16u) & 0xFu) - 8) * s_input[c+4u]  +
-                float(int((qd >> 20u) & 0xFu) - 8) * s_input[c+5u]  +
-                float(int((qd >> 24u) & 0xFu) - 8) * s_input[c+6u]  +
-                float(int((qd >> 28u) & 0xFu) - 8) * s_input[c+7u]);
+                (float(qd & 0xFu) - 8.0) * s_input[c]      +
+                (float((qd >> 4u) & 0xFu) - 8.0) * s_input[c+1u]  +
+                (float((qd >> 8u) & 0xFu) - 8.0) * s_input[c+2u]  +
+                (float((qd >> 12u) & 0xFu) - 8.0) * s_input[c+3u]  +
+                (float((qd >> 16u) & 0xFu) - 8.0) * s_input[c+4u]  +
+                (float((qd >> 20u) & 0xFu) - 8.0) * s_input[c+5u]  +
+                (float((qd >> 24u) & 0xFu) - 8.0) * s_input[c+6u]  +
+                (float(qd >> 28u) - 8.0) * s_input[c+7u]);
         }
     }
     return sum;

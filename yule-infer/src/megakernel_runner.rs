@@ -113,8 +113,8 @@ impl<'a> MegakernelRunner<'a> {
         // Q(2048) + K(256) + V(256) + attn_out(2048) + attn_proj(2048) +
         // gate(5632) + up(5632) + ffn_out(2048) + hidden(2048) + residual(2048) +
         // temp(2048) + sync(4) + partials(32)
-        let scratch_floats = dim + kv_dim + kv_dim + dim + dim + ff_dim + ff_dim + dim
-            + dim + dim + dim + 4 + 32;
+        let scratch_floats =
+            dim + kv_dim + kv_dim + dim + dim + ff_dim + ff_dim + dim + dim + dim + dim + 4 + 32;
         let scratch_size = scratch_floats * 4;
         let scratch = backend.allocate(scratch_size)?;
 
@@ -446,7 +446,10 @@ impl<'a> MegakernelRunner<'a> {
         let nan_count = logits_cpu.iter().filter(|v| v.is_nan()).count();
         tracing::debug!(
             "megakernel logits: min={:.2} max={:.2} argmax={} nan={}",
-            min_val, max_val, argmax, nan_count
+            min_val,
+            max_val,
+            argmax,
+            nan_count
         );
 
         self.pos += 1;

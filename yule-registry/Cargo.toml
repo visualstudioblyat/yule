@@ -20,3 +20,6 @@ reqwest = { workspace = true }
 blake3 = { workspace = true }
 tokio-stream = { workspace = true }
 memmap2 = { workspace = true }
+
+[lints]
+workspace = true

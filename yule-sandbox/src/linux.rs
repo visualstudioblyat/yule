@@ -99,16 +99,11 @@ impl Sandbox for LinuxSandbox {
                 }
 
                 // 2. landlock (best-effort — may not be supported)
-                let landlock_applied = match apply_landlock(&child_config) {
-                    Ok(applied) => applied,
-                    Err(_) => false,
-                };
+                let landlock_applied = apply_landlock(&child_config).unwrap_or_default();
 
                 // 3. no_new_privs (required before seccomp if landlock didn't set it)
-                if !landlock_applied {
-                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                if !landlock_applied && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
 
                 // 4. seccomp (best-effort)

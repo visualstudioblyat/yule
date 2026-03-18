@@ -55,7 +55,7 @@ impl PrefixCache {
 
         // Always iterate all entries for constant-time behavior
         let mut found = false;
-        for (key, _) in &self.entries {
+        for key in self.entries.keys() {
             // Constant-time comparison
             let mut diff = 0u8;
             for i in 0..32 {
@@ -107,7 +107,7 @@ impl PrefixCache {
         }
 
         // Verify the KV data hash matches (detect corruption)
-        let kv_hash = Self::hash_kv_data(&entry.kv_data);
+        let _kv_hash = Self::hash_kv_data(&entry.kv_data);
         let content_valid = entry.kv_data.iter().all(|layer| !layer.is_empty());
 
         if !content_valid {

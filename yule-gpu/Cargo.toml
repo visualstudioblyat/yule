@@ -26,3 +26,6 @@ cpu = []
 vulkan = ["dep:ash", "dep:gpu-allocator"]
 cuda = ["dep:cudarc"]
 metal-gpu = ["dep:metal"]
+
+[lints]
+workspace = true

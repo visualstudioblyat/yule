@@ -86,6 +86,24 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+manual_div_ceil = "allow"
+unnecessary_cast = "allow"
+collapsible_if = "allow"
+manual_unwrap_or_default = "allow"
+manual_map = "allow"
+iter_on_single_items = "allow"
+double_ended_iterator_last = "allow"
+approx_constant = "allow"
+too_many_arguments = "allow"
+mut_range_bound = "allow"
+vec_init_then_push = "allow"
+iter_on_empty_collections = "allow"
+redundant_closure = "allow"
+map_or_transform = "allow"
+iter_over_hash_type = "allow"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

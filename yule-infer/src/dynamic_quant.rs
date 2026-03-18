@@ -11,7 +11,7 @@ pub enum LayerPrecision {
 
 /// Dynamic quantization controller.
 pub struct DynamicQuantController {
-    n_layers: usize,
+    _n_layers: usize,
     precision: Vec<LayerPrecision>,
     activation_history: Vec<f64>, // EMA of activation norms per layer
     warmup_tokens: u32,
@@ -24,7 +24,7 @@ pub struct DynamicQuantController {
 impl DynamicQuantController {
     pub fn new(n_layers: usize) -> Self {
         Self {
-            n_layers,
+            _n_layers: n_layers,
             precision: vec![LayerPrecision::Full; n_layers],
             activation_history: vec![0.0; n_layers],
             warmup_tokens: 32,

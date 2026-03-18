@@ -25,3 +25,6 @@ windows-sys = { version = "0.59", features = ["Win32_Security", "Win32_System_Jo
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[lints]
+workspace = true

@@ -28,7 +28,7 @@ pub struct VerifiedKvCache {
     num_layers: u32,
     num_kv_heads: u32,
     head_dim: u32,
-    capacity: u32,
+    _capacity: u32,
     tokens_seen: u64,
     key_data: Vec<Vec<f32>>,
     value_data: Vec<Vec<f32>>,
@@ -58,7 +58,7 @@ impl VerifiedKvCache {
             num_layers,
             num_kv_heads,
             head_dim,
-            capacity,
+            _capacity: capacity,
             tokens_seen: 0,
             key_data,
             value_data,
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn test_eviction_log_circular() {
         let mut cache = VerifiedKvCache::new(1, 1, 2, 2, 3); // max 3 eviction entries
-        let stride = 2;
+        let _stride = 2;
 
         // Fill
         cache.write_kv(0, 0, &[1.0, 2.0], &[3.0, 4.0]);

@@ -90,7 +90,7 @@ impl LowRankApprox {
             // Initialize v with a deterministic vector
             let mut v = vec![0.0f32; cols];
             for (i, val) in v.iter_mut().enumerate() {
-                *val = ((i as f32 + 1.0) * 0.7071).sin();
+                *val = ((i as f32 + 1.0) * std::f32::consts::FRAC_1_SQRT_2).sin();
             }
             normalize(&mut v);
 
@@ -220,22 +220,22 @@ impl LowRankApprox {
 
         // Step 1: temp = V^T @ input  [rank]
         let mut temp = vec![0.0f32; self.rank];
-        for r in 0..self.rank {
+        for (r, t) in temp.iter_mut().enumerate() {
             let mut sum = 0.0f32;
-            for j in 0..self.cols {
-                sum += self.v[j * self.rank + r] * input[j];
+            for (j, &inp) in input.iter().enumerate() {
+                sum += self.v[j * self.rank + r] * inp;
             }
-            temp[r] = sum;
+            *t = sum;
         }
 
         // Step 2: result = U @ temp  [rows]
         let mut result = vec![0.0f32; self.rows];
-        for i in 0..self.rows {
+        for (i, res) in result.iter_mut().enumerate() {
             let mut sum = 0.0f32;
-            for r in 0..self.rank {
-                sum += self.u[i * self.rank + r] * temp[r];
+            for (r, &t) in temp.iter().enumerate() {
+                sum += self.u[i * self.rank + r] * t;
             }
-            result[i] = sum;
+            *res = sum;
         }
 
         result
@@ -322,8 +322,8 @@ mod tests {
     #[test]
     fn effective_rank_sparse() {
         let mut w = vec![0.001f32; 1000];
-        for i in 0..10 {
-            w[i] = 10.0;
+        for w_i in w.iter_mut().take(10) {
+            *w_i = 10.0;
         }
         let rank = estimate_effective_rank(&w);
         assert!(rank < 0.05, "expected low effective rank, got {rank}");
@@ -411,8 +411,8 @@ mod tests {
         // Diagonal matrix with descending values: rank-2 approx should capture top 2.
         let n = 4;
         let mut matrix = vec![0.0f32; n * n];
-        matrix[0 * n + 0] = 10.0;
-        matrix[1 * n + 1] = 5.0;
+        matrix[0] = 10.0;
+        matrix[n + 1] = 5.0;
         matrix[2 * n + 2] = 1.0;
         matrix[3 * n + 3] = 0.1;
 

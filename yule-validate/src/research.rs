@@ -86,8 +86,6 @@ fn test_50_silu_bypass_fraction(model: &LoadedTestModel, runner: &mut TestRunner
     let start = Instant::now();
 
     use yule_core::tokenizer::Tokenizer;
-    use yule_infer::SamplingParams;
-    use yule_infer::sampler::Sampler;
 
     let bos = model.tokenizer.bos_token().unwrap_or(1);
 

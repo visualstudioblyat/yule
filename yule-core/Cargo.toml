@@ -21,3 +21,6 @@ windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win
 
 [build-dependencies]
 cc = "1"
+
+[lints]
+workspace = true

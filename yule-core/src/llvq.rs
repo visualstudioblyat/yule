@@ -34,7 +34,7 @@ pub fn decode_leech_point(index: u64, scale: f32) -> [f32; 24] {
 
     // Simplified decoding: use the index bits directly as ternary coordinates.
     // Full implementation would use the Golay code algebraic structure.
-    for i in 0..24 {
+    for (i, p) in point.iter_mut().enumerate() {
         let bits = ((index >> (i * 2)) & 3) as i32;
         // Map: 00 -> -1, 01 -> 0, 10 -> +1, 11 -> -2
         let coord = match bits {
@@ -44,7 +44,7 @@ pub fn decode_leech_point(index: u64, scale: f32) -> [f32; 24] {
             3 => -2,
             _ => unreachable!(),
         };
-        point[i] = coord as f32 * scale;
+        *p = coord as f32 * scale;
     }
 
     point
@@ -61,11 +61,11 @@ pub fn dequant_llvq_group(index: u64, scale: f32, output: &mut [f32]) {
 pub fn vec_dot_llvq(index: u64, scale: f32, activation: &[f32]) -> f32 {
     let point = decode_leech_point(index, scale);
     let len = activation.len().min(24);
-    let mut sum = 0.0f32;
-    for i in 0..len {
-        sum += point[i] * activation[i];
-    }
-    sum
+    point[..len]
+        .iter()
+        .zip(activation[..len].iter())
+        .map(|(p, a)| p * a)
+        .sum()
 }
 
 /// Encode a 24D float vector to the nearest Leech lattice point.
@@ -86,8 +86,8 @@ pub fn encode_leech(weights: &[f32]) -> (u64, f32, f32) {
     let mut index = 0u64;
     let mut error = 0.0f32;
 
-    for i in 0..24 {
-        let normalized = weights[i] * inv_scale;
+    for (i, &w) in weights[..24].iter().enumerate() {
+        let normalized = w * inv_scale;
         let (bits, closest) = if normalized <= -1.5 {
             (3u64, -2.0)
         } else if normalized <= -0.5 {
@@ -167,36 +167,31 @@ mod tests {
     fn test_known_point_decoding() {
         // index = 0 means all 24 pairs of bits are 00 -> coord = -1
         let point = decode_leech_point(0, 1.0);
-        for i in 0..24 {
+        for (i, &val) in point.iter().enumerate().take(24) {
             assert!(
-                (point[i] - (-1.0)).abs() < 1e-6,
+                (val - (-1.0)).abs() < 1e-6,
                 "coord {}: expected -1.0, got {}",
                 i,
-                point[i]
+                val
             );
         }
 
         // index with all bits = 01 (value 1 in each 2-bit slot) -> coord = 0
         let all_ones: u64 = (0..24).fold(0u64, |acc, i| acc | (1u64 << (i * 2)));
         let point = decode_leech_point(all_ones, 2.0);
-        for i in 0..24 {
-            assert!(
-                point[i].abs() < 1e-6,
-                "coord {}: expected 0.0, got {}",
-                i,
-                point[i]
-            );
+        for (i, &val) in point.iter().enumerate().take(24) {
+            assert!(val.abs() < 1e-6, "coord {}: expected 0.0, got {}", i, val);
         }
 
         // index with all bits = 10 (value 2 in each 2-bit slot) -> coord = +1
         let all_twos: u64 = (0..24).fold(0u64, |acc, i| acc | (2u64 << (i * 2)));
         let point = decode_leech_point(all_twos, 3.0);
-        for i in 0..24 {
+        for (i, &val) in point.iter().enumerate().take(24) {
             assert!(
-                (point[i] - 3.0).abs() < 1e-6,
+                (val - 3.0).abs() < 1e-6,
                 "coord {}: expected 3.0, got {}",
                 i,
-                point[i]
+                val
             );
         }
     }
@@ -208,12 +203,12 @@ mod tests {
         let mut output = [0.0f32; 24];
         dequant_llvq_group(index, scale, &mut output);
 
-        for i in 0..24 {
+        for (i, &val) in output.iter().enumerate().take(24) {
             assert!(
-                (output[i] - (-2.0)).abs() < 1e-6,
+                (val - (-2.0)).abs() < 1e-6,
                 "coord {}: expected -2.0, got {}",
                 i,
-                output[i]
+                val
             );
         }
     }
@@ -236,8 +231,8 @@ mod tests {
     #[test]
     fn test_vec_dot_matches_dequant() {
         let mut weights = [0.0f32; 24];
-        for i in 0..24 {
-            weights[i] = (i as f32 - 12.0) * 0.15;
+        for (i, w) in weights.iter_mut().enumerate().take(24) {
+            *w = (i as f32 - 12.0) * 0.15;
         }
 
         let (index, scale, _error) = encode_leech(&weights);

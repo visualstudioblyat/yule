@@ -17,3 +17,6 @@ ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 getrandom = { workspace = true }
+
+[lints]
+workspace = true

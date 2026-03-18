@@ -105,7 +105,7 @@ impl TensorProtection {
         let total_blocks = if data.is_empty() {
             0
         } else {
-            (data.len() + block_size - 1) / block_size
+            data.len().div_ceil(block_size)
         };
 
         let mut checksums = Vec::with_capacity(total_blocks);

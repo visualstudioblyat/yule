@@ -31,3 +31,6 @@ blake3 = { workspace = true }
 [features]
 default = []
 vulkan = ["yule-gpu/vulkan", "yule-infer/vulkan"]
+
+[lints]
+workspace = true

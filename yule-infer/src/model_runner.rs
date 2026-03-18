@@ -670,11 +670,11 @@ impl<'a> TransformerRunner<'a> {
             }
 
             // attention
-            let attn_seq_len = if self.streaming_cache.is_some() {
-                self.streaming_cache.as_ref().unwrap().effective_len() as usize
-            } else {
-                seq_len
-            };
+            let attn_seq_len = self
+                .streaming_cache
+                .as_ref()
+                .map(|c| c.effective_len() as usize)
+                .unwrap_or(seq_len);
 
             self.scratch.attn_out.fill(0.0);
             let scale = 1.0 / (hd as f32).sqrt();
@@ -784,7 +784,7 @@ impl<'a> TransformerRunner<'a> {
             }
 
             // Dynamic quant: conditionally skip FFN
-            let skip_ffn = self.dyn_quant.as_mut().map_or(false, |dqc| {
+            let skip_ffn = self.dyn_quant.as_mut().is_some_and(|dqc| {
                 let norm = activation_norm(&self.hidden);
                 dqc.update(layer, norm as f64);
                 dqc.precision(layer) == LayerPrecision::Skip
